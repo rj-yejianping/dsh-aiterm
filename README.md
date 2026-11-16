@@ -45,6 +45,11 @@ npm pack                       # → dsh-aiterm-0.5.0.tgz
 
 装好后浏览器 `Ctrl+F5` 硬刷新一次：客户端半边由宿主重打包，SPA 内切页不够。
 
+> **不会触发 pnpm 的构建脚本门禁。** `ssh2` 本身是纯 JS，但它的两个**可选**原生加速件
+> （`cpu-features` 与内建的 `sshcrypto` 绑定）带 `install` / `node-gyp rebuild` 脚本，
+> pnpm 10+ 会因此挂起安装等人工批准。本包已把 ssh2 打成 `vendor/ssh2.cjs` 随包发布，
+> **依赖图里没有任何安装脚本**；缺少原生件时 ssh2 自动回落纯 JS，功能不受影响。
+
 ### 从 ssh-telnet 升级（破坏性）
 
 0.5.0 把工具名、路由、数据目录、凭据作用域和存储键全部从 `ssh-telnet` 改成 `aiterm`，**不保留旧别名**。
@@ -388,6 +393,7 @@ print('hello from the remote host')
 npm install          # 运行时依赖 ssh2 / @xterm/headless / @xterm/addon-serialize，
                      # 以及构建用 devDeps：esbuild、@xterm/xterm、@xterm/addon-fit
 npm run build        # 从 client/**.jsx 重新生成 lib/client.js（模块 id 取自 package.json 的 name）
+npm run build:vendor # 重新打包 vendor/ssh2.cjs（需要 devDependency ssh2 + esbuild）
 npm run lint         # node --check 全部 Host 端源码
 npm test             # 客户端冒烟：槽位注册、locale 键、RPC 方法覆盖
 ```

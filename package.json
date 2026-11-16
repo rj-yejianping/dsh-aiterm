@@ -1,6 +1,6 @@
 {
   "name": "dsh-aiterm",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "SSH and Telnet terminals for DeepSeek Harness: one real terminal shared by you and the AI, with per-session AI permissions and token-cheap delta reads.",
   "type": "module",
   "license": "MIT",
@@ -42,22 +42,24 @@
     "icon.svg",
     "README.md",
     "LICENSE",
-    "CONTRACTS.md"
+    "CONTRACTS.md",
+    "vendor"
   ],
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "lint": "node --check lib/index.js && for f in lib/host/*.js lib/host/transports/*.js; do node --check \"$f\" || exit 1; done",
-    "test": "node scripts/smoke-client.mjs"
+    "test": "node scripts/smoke-client.mjs",
+    "build:vendor": "node scripts/build-vendor.mjs"
   },
   "dependencies": {
     "@xterm/addon-serialize": "^0.14.0",
-    "@xterm/headless": "^6.0.0",
-    "ssh2": "^1.17.0"
+    "@xterm/headless": "^6.0.0"
   },
   "devDependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "esbuild": "^0.28.2"
+    "esbuild": "^0.28.2",
+    "ssh2": "1.17.0"
   },
   "dsh": {
     "bundle": {
