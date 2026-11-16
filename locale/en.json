@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "aiterm",
+    "description": "Multi-session SSH and Telnet terminals shared by you and the AI, with per-session AI permission modes (read-only, write-only, read-write) and human-write blocking while the AI operates."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "aiterm",
+    "description": "人与 AI 协同使用的多会话 SSH / Telnet 终端：按会话设置 AI 权限（只读 / 只写 / 读写），AI 操作时自动屏蔽人工输入。"
+  }
+}
