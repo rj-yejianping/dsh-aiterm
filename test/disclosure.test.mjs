@@ -12,6 +12,7 @@ import test from 'node:test'
 
 import { DEFAULT_CONFIG, resolveConfig } from '../lib/host/config.js'
 import { createDisclosure } from '../lib/host/disclosure.js'
+import { registerTools } from '../lib/host/tools.js'
 
 /** The 21 tools that exist in `lib/host/tools.js`, grouped by the brief. */
 const GROUPS = {
@@ -95,7 +96,9 @@ test('missing or invalid mode falls back to full disclosure for every Agent', ()
     assert.deepEqual(found.visible, ALL_TOOLS)
     for (const name of ALL_TOOLS) {
       assert.equal(disclosure.isVisible(agentA, name), true, name)
-      assert.equal(disclosure.isVisible(undefined, name), true, `full mode is unconditional: ${name}`)
+      for (const invalidAgent of [undefined, null, {}, { tools: {}, logger: {} }, function agent() {}]) {
+        assert.equal(disclosure.isVisible(invalidAgent, name), false, `${String(invalidAgent)}:${name}`)
+      }
     }
     assert.equal(disclosure.isVisible(agentA, 'aiterm_discover'), false)
     disclosure.dispose()
@@ -156,6 +159,9 @@ test('expansion is owned by the Agent object: B, children, and same-id replaceme
 
   const openedB = disclosure.expand(agentB, 'history')
   assert.deepEqual(openedB.expanded, ['history'])
+  const openedReplacement = disclosure.expand(agentAReplacement, 'management')
+  assert.equal(openedReplacement.ok, true)
+  assert.deepEqual(disclosure.discover(agentAReplacement).expanded, ['management'])
   assert.deepEqual(disclosure.discover(agentA).expanded, ['session'])
   assert.deepEqual(disclosure.discover(agentB).expanded, ['history'])
   assert.deepEqual(disclosure.discover(agentAChild).expanded, [])
@@ -182,9 +188,22 @@ test('repeated and interleaved expansion is idempotent and order-stable', () => 
   assert.equal(disclosure.isVisible(agentB, 'aiterm_close'), true)
 })
 
-test('missing Agent identity and unknown groups are refused without changing state', () => {
+test('invalid Agent identity and unknown groups are refused without changing state', () => {
   const disclosure = disclose('progressive')
-  for (const invalidAgent of [undefined, null, 'agent-a', 42, true]) {
+  for (const invalidAgent of [
+    undefined,
+    null,
+    'agent-a',
+    42,
+    true,
+    {},
+    { tools: {}, logger: {} },
+    { session: { header: {} } },
+    function agent() {},
+    { id: '' },
+    { id: '   ' },
+    { id: 42 },
+  ]) {
     const expanded = disclosure.expand(invalidAgent, 'session')
     assert.equal(expanded.ok, false, String(invalidAgent))
     assert.equal(expanded.error, 'missing-agent')
@@ -198,7 +217,7 @@ test('missing Agent identity and unknown groups are refused without changing sta
     assert.deepEqual(found.groups, [])
     assert.deepEqual(found.visible, [])
   }
-  for (const invalidGroup of ['SESSION', 'list', 'aiterm_list', '', null, 42]) {
+  for (const invalidGroup of ['SESSION', 'list', 'aiterm_list', '', null, 42, { group: 'session' }]) {
     const expanded = disclosure.expand(agentA, invalidGroup)
     assert.equal(expanded.ok, false, String(invalidGroup))
     assert.equal(expanded.error, 'unknown-group')
@@ -284,7 +303,7 @@ test('scope-local impostors shadowing an aiterm name are not advertised', () => 
   assert.deepEqual(groupMap(disclosure.discover(agentB)), GROUPS)
 })
 
-test('a missing or throwing tools.get fails closed with no advertised names', () => {
+test('a missing or throwing tools.get reports unavailability and does not expand', () => {
   const alwaysThrows = {
     get() {
       throw new Error('tool view unavailable')
@@ -299,17 +318,129 @@ test('a missing or throwing tools.get fails closed with no advertised names', ()
   for (const tools of [undefined, {}, { get: undefined }, { get: null }, alwaysThrows, throwsForAgent]) {
     const disclosure = disclose('progressive', tools)
     const found = disclosure.discover(agentA)
-    assert.equal(found.ok, true, String(tools))
-    assert.equal(found.catalogUnavailable, true, String(tools))
-    for (const { tools: names } of found.groups) assert.deepEqual(names, [])
+    assert.equal(found.ok, false, String(tools))
+    assert.equal(found.error, 'catalog-unavailable', String(tools))
+    assert.deepEqual(found.groups, [])
     assert.deepEqual(found.visible, [])
 
     const expanded = disclosure.expand(agentA, 'session')
-    assert.equal(expanded.ok, true)
-    assert.equal(expanded.catalogUnavailable, true)
-    for (const { tools: names } of expanded.groups) assert.deepEqual(names, [])
+    assert.equal(expanded.ok, false)
+    assert.equal(expanded.error, 'catalog-unavailable')
+    assert.deepEqual(expanded.expanded, [])
     assert.deepEqual(expanded.visible, [])
+    assert.equal(disclosure.isVisible(agentA, 'aiterm_list'), false)
   }
+})
+
+test('a failed expansion leaves state untouched and can be retried after recovery', () => {
+  const definitions = new Map(ALL_TOOLS.map((name) => [name, Object.freeze({ name })]))
+  let broken = true
+  const tools = {
+    get(name, agent) {
+      if (broken) throw new Error('tool view unavailable')
+      if (agent === undefined) return definitions.get(name)
+      return definitions.get(name)
+    },
+  }
+  const disclosure = disclose('progressive', tools)
+
+  assert.equal(disclosure.expand(agentA, 'session').error, 'catalog-unavailable')
+  assert.equal(disclosure.isVisible(agentA, 'aiterm_list'), false)
+  assert.deepEqual(disclosure.discover(agentA).expanded, [])
+
+  broken = false
+  assert.deepEqual(disclosure.discover(agentA).expanded, [])
+  const retried = disclosure.expand(agentA, 'session')
+  assert.equal(retried.ok, true)
+  assert.equal(disclosure.isVisible(agentA, 'aiterm_list'), true)
+})
+
+test('expanding a group whose tools are all hidden is refused without changing state', () => {
+  const definitions = new Map(ALL_TOOLS.map((name) => [name, Object.freeze({ name })]))
+  const hidden = new Set(GROUPS.session)
+  const tools = {
+    get(name, agent) {
+      if (agent === undefined) return definitions.get(name)
+      return hidden.has(name) ? undefined : definitions.get(name)
+    },
+  }
+  const disclosure = disclose('progressive', tools)
+  assert.equal(disclosure.expand(agentA, 'history').ok, true)
+
+  const refused = disclosure.expand(agentA, 'session')
+  assert.equal(refused.ok, false)
+  assert.equal(refused.error, 'no-visible-tools')
+  assert.deepEqual(refused.expanded, ['history'])
+  assert.deepEqual(disclosure.discover(agentA).expanded, ['history'])
+  assert.equal(disclosure.isVisible(agentA, 'aiterm_read'), false)
+
+  hidden.delete('aiterm_list')
+  const partial = disclosure.expand(agentA, 'session')
+  assert.equal(partial.ok, true)
+  assert.deepEqual(partial.expanded, ['session', 'history'])
+  assert.deepEqual(partial.visible, ['aiterm_list', ...GROUPS.history])
+  assert.equal(disclosure.isVisible(agentA, 'aiterm_list'), true)
+  // isVisible reports the expansion gate only; DSH's restriction still removes
+  // the hidden sibling, so the catalogue must keep it out of `visible`.
+  assert.equal(disclosure.isVisible(agentA, 'aiterm_read'), true)
+  assert.equal(partial.visible.includes('aiterm_read'), false)
+  assert.equal(partial.groups.find(({ group }) => group === 'session').tools.includes('aiterm_read'), false)
+})
+
+test('tool names hidden from an Agent never appear in any serialized result or refusal', () => {
+  const hidden = new Map([[agentA, new Set(['aiterm_list'])]])
+  const disclosure = disclose('progressive', makeTools({ hidden }))
+  const results = [
+    disclosure.discover(agentA),
+    disclosure.expand(agentA, 'session'),
+    disclosure.discover(undefined),
+    disclosure.expand(undefined, 'session'),
+    disclosure.expand(agentA, 'not-a-group'),
+    disclosure.discover({}),
+    disclosure.discover({ tools: {}, logger: {} }),
+  ]
+  assert.equal(JSON.stringify(results).includes('aiterm_list'), false)
+
+  const blackout = disclose('progressive', makeTools({ hidden: new Map([[agentA, new Set(ALL_TOOLS)]]) }))
+  const blackoutResults = JSON.stringify([blackout.discover(agentA), blackout.expand(agentA, 'session')])
+  assert.equal(blackout.expand(agentA, 'session').error, 'no-visible-tools')
+  for (const name of ALL_TOOLS) {
+    assert.equal(blackoutResults.includes(name), false, name)
+  }
+})
+
+test('unknown group input is not reflected back', () => {
+  const disclosure = disclose('progressive')
+  const hostile = `aiterm_${'x'.repeat(4096)}`
+  const refused = disclosure.expand(agentA, hostile)
+  assert.equal(refused.ok, false)
+  assert.equal(refused.error, 'unknown-group')
+  assert.equal(Object.hasOwn(refused, 'group'), false)
+  assert.equal(JSON.stringify(refused).includes(hostile), false)
+  assert.deepEqual(disclosure.discover(agentA).expanded, [])
+})
+
+test('the real tools.js registrations equal the union of the disclosure groups', () => {
+  const registered = []
+  const ctx = {
+    effect(run) {
+      run()
+      return () => {}
+    },
+    tools: {
+      register(definition) {
+        registered.push(definition)
+        return () => {}
+      },
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  }
+  registerTools(ctx, { config: {}, logger: ctx.logger })
+
+  const names = registered.map((definition) => definition.name)
+  assert.equal(names.length, 21)
+  assert.equal(new Set(names).size, names.length)
+  assert.deepEqual([...names].sort(), [...ALL_TOOLS].sort())
 })
 
 test('discovery records cross-group prerequisites and permission hints', () => {
