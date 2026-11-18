@@ -90,6 +90,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const [listError, setListError] = useState(null)
   const [listTruncated, setListTruncated] = useState(false)
   const [listTotal, setListTotal] = useState(0)
+  const [loadMoreBusy, setLoadMoreBusy] = useState(false)
   const [pickedId, setPickedId] = useState(null)
   /** Exact incarnation address when several entries share one logical id. */
   const [pickedHistoryId, setPickedHistoryId] = useState(null)
@@ -105,6 +106,8 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   /** Auto-log (write every session to a file) state. */
   const [autoLog, setAutoLog] = useState({ enabled: false, dir: '', needsReview: false })
   const [autoLogBusy, setAutoLogBusy] = useState(false)
+  const [autoLogLoading, setAutoLogLoading] = useState(true)
+  const [autoLogError, setAutoLogError] = useState(null)
   /**
    * False when the running Host predates the export / auto-log RPCs. The
    * client bundle updates on refresh but the Host only on restart, so a fresh
@@ -275,10 +278,13 @@ export function HistoryPanel({ t, sessionId, onClose }) {
           dir: typeof state.dir === 'string' ? state.dir : '',
           needsReview: state.needsReview === true,
         })
+        setAutoLogLoading(false)
       })
       .catch((error) => {
         if (cancelled) return
+        setAutoLogLoading(false)
         if (error && error.code === 'UNKNOWN_METHOD') setLogBackend(false)
+        else setAutoLogError(errorMessage(error))
       })
     return () => {
       cancelled = true
@@ -328,7 +334,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
 
   /** Flip the Host auto-log switch. @returns {Promise<void>} resolves when applied. */
   const toggleAutoLog = async (explicitNext) => {
-    if (autoLogBusy) return
+    if (autoLogBusy || autoLogLoading || autoLogError !== null) return
     // A legacy enabled setting may only be changed through the two explicit
     // buttons (keep off / confirm old path); a stray toggle cannot enable it.
     if (autoLog.needsReview && explicitNext !== false) return
@@ -356,10 +362,10 @@ export function HistoryPanel({ t, sessionId, onClose }) {
 
   /** Explicitly confirm a legacy enabled switch and its old directory. */
   const confirmLegacyEnable = async () => {
-    if (autoLogBusy) return
+    if (autoLogBusy || autoLogLoading || autoLogError !== null) return
     setAutoLogBusy(true)
     try {
-      const next = await autologSet({ enabled: true, dir: autoLog.dir })
+      const next = await autologSet({ enabled: true, dir: autoLog.dir, confirmLegacy: true })
       setAutoLog({
         enabled: next && next.enabled === true,
         dir: next && typeof next.dir === 'string' ? next.dir : autoLog.dir,
@@ -459,6 +465,35 @@ export function HistoryPanel({ t, sessionId, onClose }) {
     }
   }
 
+  /** Fetch the next page for the current (normal or legacy) source. */
+  const loadMore = async () => {
+    if (loadMoreBusy) return
+    setLoadMoreBusy(true)
+    try {
+      const offset = sessions.length
+      const raw = legacyMode
+        ? await legacyHistorySessions({ limit: 50, offset })
+        : await historySessions({ limit: 50, offset })
+      const more = raw && Array.isArray(raw.sessions)
+        ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
+        : []
+      const seen = new Set(sessions.map((entry) => entry.historyId || `${entry.id}:${entry.createdAt}`))
+      const appended = more.filter((entry) => {
+        const key = entry.historyId || `${entry.id}:${entry.createdAt}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      setSessions([...sessions, ...appended])
+      setListTruncated(raw?.truncated === true)
+      setListTotal(typeof raw?.total === 'number' ? raw.total : sessions.length + appended.length)
+    } catch (error) {
+      notify(fmt(t, 'historySessionsFailed', { message: errorMessage(error) }))
+    } finally {
+      setLoadMoreBusy(false)
+    }
+  }
+
   const footer = (
     <>
       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -524,8 +559,13 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       {listState === 'empty' ? <div style={S.auditEmpty}>{t('historySessionsEmpty')}</div> : null}
 
       {listTruncated ? (
-        <div style={S.hint} role="status">
-          {fmt(t, 'historySessionsTruncated', { shown: sessions.length, total: listTotal })}
+        <div style={S.actionRow}>
+          <span style={S.hint} role="status">
+            {fmt(t, 'historySessionsTruncated', { shown: sessions.length, total: listTotal })}
+          </span>
+          <Btn onClick={loadMore} busy={loadMoreBusy} disabled={loadMoreBusy}>
+            {t('historyLoadMore')}
+          </Btn>
         </div>
       ) : null}
       {sessions.length > 0 ? (
@@ -668,7 +708,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         <input
           type="checkbox"
           checked={autoLog.enabled}
-          disabled={autoLogBusy || !logBackend || autoLog.needsReview}
+          disabled={autoLogBusy || autoLogLoading || autoLogError !== null || !logBackend || autoLog.needsReview}
           onChange={() => toggleAutoLog()}
           style={S.pickBox}
         />
@@ -677,6 +717,8 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       <span style={S.hint}>
         {autoLog.enabled ? fmt(t, 'historyAutoLogWhere', { dir: autoLog.dir }) : t('historyAutoLogOffHint')}
       </span>
+      {autoLogLoading ? <div style={S.hint} role="status">{t('historyAutoLogLoading')}</div> : null}
+      {autoLogError !== null ? <div style={S.formError} role="alert">{fmt(t, 'historyAutoLogLoadFailed', { message: autoLogError })}</div> : null}
       {autoLog.needsReview ? (
         <div style={S.hint} role="status">
           {t('historyAutoLogLegacyReview')}
@@ -689,10 +731,10 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       ) : null}
       {autoLog.needsReview ? (
         <div style={S.actionRow}>
-          <Btn onClick={() => toggleAutoLog(false)} disabled={autoLogBusy || !logBackend}>
+          <Btn onClick={() => toggleAutoLog(false)} disabled={autoLogBusy || autoLogLoading || autoLogError !== null || !logBackend}>
             {t('historyAutoLogLegacyKeepOff')}
           </Btn>
-          <Btn onClick={confirmLegacyEnable} disabled={autoLogBusy || !logBackend}>
+          <Btn onClick={confirmLegacyEnable} disabled={autoLogBusy || autoLogLoading || autoLogError !== null || !logBackend}>
             {t('historyAutoLogLegacyEnable')}
           </Btn>
         </div>
@@ -711,6 +753,15 @@ export function HistoryPanel({ t, sessionId, onClose }) {
               {fmt(t, 'historyExportSkipped', {
                 count: exported.skipped.length,
                 sessions: exported.skipped.map((entry) => entry.sessionId).join(', '),
+              })}
+            </div>
+          ) : null}
+          {exported.omitted ? (
+            <div style={S.hint}>
+              {fmt(t, 'historyExportOmitted', {
+                count: exported.omitted.count,
+                reason: exported.omitted.reason,
+                limit: exported.omitted.limit,
               })}
             </div>
           ) : null}

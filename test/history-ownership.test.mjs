@@ -16,6 +16,8 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { generateKeyPairSync } from 'node:crypto'
+import ssh2 from 'ssh2'
 import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, rmdir, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -25,7 +27,8 @@ import { DEFAULT_CONFIG, resolveConfig } from '../lib/host/config.js'
 import { exportSessions } from '../lib/host/exporter.js'
 import { HistoryStore } from '../lib/host/history-store.js'
 import { createPermission } from '../lib/host/permission.js'
-import { SessionRegistry } from '../lib/host/registry.js'
+import { SessionRegistry, ownerScopedRegistry } from '../lib/host/registry.js'
+import { registerRoutes } from '../lib/host/routes.js'
 import { registerTools } from '../lib/host/tools.js'
 
 /** Base timestamp for deterministic journals. */
@@ -1024,12 +1027,12 @@ test('a failed close flush keeps the bytes and does not stamp a permission', asy
   await withDir(async (dir) => {
     let failures = 1
     class FailingAppendStore extends HistoryStore {
-      async appendJournal(file, data) {
+      async writeHandle(handle, buffer) {
         if (failures > 0) {
           failures -= 1
           throw new Error('simulated append failure')
         }
-        return super.appendJournal(file, data)
+        return super.writeHandle(handle, buffer)
       }
     }
     const store = new FailingAppendStore({
@@ -1052,13 +1055,7 @@ test('a failed close flush keeps the bytes and does not stamp a permission', asy
     assert.equal(failedRaw.includes('FLUSH-MUST-SURVIVE'), false, 'the simulated append failed before bytes reached disk')
     assert.equal(failedRaw.includes('"_aiterm":"close"'), false, 'a failed flush must not stamp a close permission')
 
-    // The bytes are still buffered; restoring the writer flushes them.
-    await store.flush('st-1')
-    const raw = await readFile(journal, 'utf8')
-    assert.equal(decodedOutput(raw).includes('FLUSH-MUST-SURVIVE'), true, 'the close flush bytes must be retained and retryable')
-    assert.equal(raw.includes('"_aiterm":"close"'), false, 'the permission may only be stamped after a successful flush')
-
-    // Unknown permission after the failed close: AI fails closed, human reads.
+    // While unsaved, AI is fail-closed and the human can still read.
     const blocked = makeStore(dir)
     await blocked.init()
     const blockedRegistry = makeRegistry(dir, blocked)
@@ -1066,13 +1063,15 @@ test('a failed close flush keeps the bytes and does not stamp a permission', asy
       () => blockedRegistry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai' }),
       'AI_READ_DENIED',
     )
-    const human = await blockedRegistry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'human', search: 'FLUSH-MUST-SURVIVE' })
-    assert.equal(human.matches.length, 1)
     await blockedRegistry.dispose()
 
-    // A later close retry records the permission normally.
-    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 3, permission: { aiAccess: 'rw' } })
-    await settle(store)
+    // Restoring the writer flushes the bytes and automatically retries the
+    // retained close intent.
+    await store.flush('st-1')
+    const raw = await readFile(journal, 'utf8')
+    assert.equal(decodedOutput(raw).includes('FLUSH-MUST-SURVIVE'), true, 'the close flush bytes must be retained and retryable')
+    assert.equal(raw.includes('"_aiterm":"close"'), true, 'the retained close intent is written after recovery')
+
     const recovered = makeStore(dir)
     await recovered.init()
     const recoveredRegistry = makeRegistry(dir, recovered)
@@ -1224,7 +1223,21 @@ test('the human can explicitly re-enable a legacy autolog setting', async () => 
     const autolog = new AutoLog({ dataDir: dir, settingsFile, log: () => {} })
     await autolog.init()
     assert.equal(autolog.get().needsReview, true)
-    const enabled = await autolog.set({ enabled: true })
+    await assert.rejects(
+      () => autolog.set({ enabled: true }),
+      (error) => {
+        assert.equal(error?.code, 'LEGACY_AUTOLOG_CONFIRM_REQUIRED')
+        return true
+      },
+    )
+    await assert.rejects(
+      () => autolog.set({ enabled: true, dir: join(dir, 'different'), confirmLegacy: true }),
+      (error) => {
+        assert.equal(error?.code, 'LEGACY_AUTOLOG_DIR_MISMATCH')
+        return true
+      },
+    )
+    const enabled = await autolog.set({ enabled: true, dir: logsDir, confirmLegacy: true })
     assert.equal(enabled.enabled, true)
     assert.equal(enabled.needsReview, false)
     const saved = JSON.parse(await readFile(settingsFile, 'utf8'))
@@ -1682,7 +1695,7 @@ test('revoking AI read during export fails closed, and closing during export use
     releaseFlush()
     const result = await exportPromise
     assert.equal(result.files.length, 0, 'revoked live read must not produce an export file')
-    assert.ok(result.skipped.length > 0)
+    assert.ok(result.skipped.some((entry) => entry.code === 'AI_READ_DENIED'), 'revocation must be a stable AI_READ_DENIED skip')
     assert.equal(result.skipped.some((entry) => String(entry.message).includes('POST-REVOKE-SECRET')), false)
 
     // Restore read, gate again, and close the session while the export runs.
@@ -1869,9 +1882,9 @@ test('a permanently failing writer bounds pending bytes, drops visibly and recov
     let failing = true
     const logs = []
     class FailingStore extends HistoryStore {
-      async appendJournal(file, data) {
+      async writeHandle(handle, buffer) {
         if (failing) throw new Error('simulated permanent disk failure')
-        return super.appendJournal(file, data)
+        return super.writeHandle(handle, buffer)
       }
     }
     const store = new FailingStore({
@@ -1912,5 +1925,625 @@ test('a permanently failing writer bounds pending bytes, drops visibly and recov
     assert.equal(text.includes('CHUNK-00 '), false, 'old unsaved bytes were explicitly dropped')
     await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 101, permission: { aiAccess: 'rw' } })
     await store.dispose()
+  })
+})
+
+test('a failed close metadata append is retried for exactly its incarnation and stays fail-closed', async () => {
+  await withDir(async (dir) => {
+    class CloseFailStore extends HistoryStore {
+      constructor(options) {
+        super(options)
+        this.closeFailures = 1
+      }
+      async appendCloseLine(file, line) {
+        if (this.closeFailures > 0) {
+          this.closeFailures -= 1
+          throw new Error('simulated close metadata failure')
+        }
+        return super.appendCloseLine(file, line)
+      }
+    }
+    const store = new CloseFailStore({ dir, flushIntervalMs: 5, log: () => {} })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'one', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'CLOSE-INTENT\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    assert.equal(store.active.get('st-1')?.pendingClose?.aiAccess, 'rw', 'the close intent and permission must be retained')
+    // Stop the automatic retry timer so the fail-closed assertion is
+    // deterministic; the retry is exercised explicitly below.
+    const stateOne = store.active.get('st-1')
+    if (stateOne?.timer !== undefined) {
+      clearTimeout(stateOne.timer)
+      stateOne.timer = undefined
+    }
+
+    const blocked = makeStore(dir)
+    await blocked.init()
+    const blockedRegistry = makeRegistry(dir, blocked)
+    await rejectsWithCode(
+      () => blockedRegistry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai' }),
+      'AI_READ_DENIED',
+      'the failed close metadata keeps AI fail-closed',
+    )
+
+    // A second session closing normally must not receive the pending intent.
+    await store.openSession({
+      id: 'st-2', owner: 'owner-a', title: 'two', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + 3,
+    })
+    store.appendChunk('st-2', 'OTHER\n', T0 + 4, 'owner-a')
+    await store.closeSession('st-2', { owner: 'owner-a', closedAt: T0 + 5, permission: { aiAccess: 'rw' } })
+    await store.flush('st-1')
+    await settle(store)
+
+    const recovered = makeStore(dir)
+    await recovered.init()
+    const registry = makeRegistry(dir, recovered)
+    const first = await registry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai', search: 'CLOSE-INTENT' })
+    assert.equal(first.matches.length, 1)
+    const second = await registry.historyQuery({ sessionId: 'st-2', owner: 'owner-a', actor: 'ai', search: 'OTHER' })
+    assert.equal(second.matches.length, 1)
+    await registry.dispose()
+    await blockedRegistry.dispose()
+    await store.dispose()
+  })
+})
+
+test('a permanently failing close metadata append stays fail-closed after dispose', async () => {
+  await withDir(async (dir) => {
+    class AlwaysFailStore extends HistoryStore {
+      async appendCloseLine() {
+        throw new Error('permanent close metadata failure')
+      }
+    }
+    const store = new AlwaysFailStore({ dir, flushIntervalMs: 5, log: () => {} })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'perm', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'NEVER-READY\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await store.dispose()
+    const fresh = makeStore(dir)
+    await fresh.init()
+    const registry = makeRegistry(dir, fresh)
+    await rejectsWithCode(
+      () => registry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai' }),
+      'AI_READ_DENIED',
+    )
+    await registry.dispose()
+  })
+})
+
+test('a partial append is rolled back before retry, leaving valid NDJSON', async () => {
+  await withDir(async (dir) => {
+    class PartialAppendStore extends HistoryStore {
+      constructor(options) {
+        super(options)
+        this.failNext = false
+      }
+      async writeHandle(handle, buffer) {
+        if (this.failNext) {
+          this.failNext = false
+          const partial = Math.min(10, buffer.length)
+          await handle.write(buffer, 0, partial)
+          const error = new Error('simulated ENOSPC after a partial write')
+          error.code = 'ENOSPC'
+          throw error
+        }
+        return super.writeHandle(handle, buffer)
+      }
+    }
+    const store = new PartialAppendStore({ dir, flushIntervalMs: 60_000, log: () => {} })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'tx', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'FIRST-RECORD\n', T0 + 1, 'owner-a')
+    await store.flush('st-1')
+    store.appendChunk('st-1', 'SECOND-RECORD\n', T0 + 2, 'owner-a')
+    store.failNext = true
+    await store.flush('st-1')
+    const journal = store.activeJournal('st-1', 'owner-a')
+    const afterFailure = await readFile(journal, 'utf8')
+    assert.equal(decodedOutput(afterFailure).includes('FIRST-RECORD'), true)
+    assert.equal(decodedOutput(afterFailure).includes('SECOND-RECORD'), false)
+    for (const line of afterFailure.split('\n').filter((value) => value.length > 0)) {
+      assert.doesNotThrow(() => JSON.parse(line), 'no partial NDJSON line may remain')
+    }
+    assert.equal((await store.stats('st-1')).degraded, true)
+
+    await store.flush('st-1')
+    const recovered = await readFile(journal, 'utf8')
+    const lines = recovered.split('\n').filter((value) => value.length > 0)
+    assert.equal(lines.filter((line) => line.includes(Buffer.from('SECOND-RECORD\n').toString('base64'))).length, 1, 'retry must append the batch exactly once')
+    assert.equal(decodedOutput(recovered).includes('SECOND-RECORD'), true)
+    await store.dispose()
+  })
+})
+
+test('a failed rollback marks the journal corrupt and never stamps close permission', async () => {
+  await withDir(async (dir) => {
+    class CorruptAppendStore extends HistoryStore {
+      constructor(options) {
+        super(options)
+        this.failNext = false
+      }
+      async writeHandle(handle, buffer) {
+        if (this.failNext) {
+          this.failNext = false
+          await handle.write(buffer, 0, Math.min(8, buffer.length))
+          throw new Error('simulated ENOSPC')
+        }
+        return super.writeHandle(handle, buffer)
+      }
+      async truncateHandle() {
+        throw new Error('simulated rollback failure')
+      }
+    }
+    const store = new CorruptAppendStore({ dir, flushIntervalMs: 60_000, log: () => {} })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'corrupt', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'BEFORE\n', T0 + 1, 'owner-a')
+    await store.flush('st-1')
+    store.appendChunk('st-1', 'CORRUPTING\n', T0 + 2, 'owner-a')
+    store.failNext = true
+    await store.flush('st-1')
+    const stats = await store.stats('st-1')
+    assert.equal(stats.corrupt, true)
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 3, permission: { aiAccess: 'rw' } })
+    const journal = store.activeJournal('st-1', 'owner-a')
+    const raw = journal === undefined ? '' : await readFile(journal, 'utf8')
+    assert.equal(raw.includes('"_aiterm":"close"'), false, 'a corrupt journal must not receive a close permission')
+    await store.dispose()
+    const fresh = makeStore(dir)
+    await fresh.init()
+    const registry = makeRegistry(dir, fresh)
+    await rejectsWithCode(
+      () => registry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai' }),
+      'AI_READ_DENIED',
+    )
+    await registry.dispose()
+  })
+})
+
+test('a failed retire does not leave a newly reserved orphan journal', async () => {
+  await withDir(async (dir) => {
+    class FailingAppendStore extends HistoryStore {
+      async writeHandle() {
+        throw new Error('simulated append failure')
+      }
+    }
+    const store = new FailingAppendStore({ dir, flushIntervalMs: 60_000, log: () => {} })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'old', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'UNSAVED\n', T0 + 1, 'owner-a')
+    const before = (await readdir(dir)).filter((name) => name.endsWith('.ndjson'))
+    const opened = await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'new', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + 2,
+    })
+    assert.equal(opened, false, 'the old unsaved writer must not be retired')
+    const after = (await readdir(dir)).filter((name) => name.endsWith('.ndjson'))
+    assert.deepEqual(after, before, 'no new reservation may remain after a failed retire')
+    await store.dispose()
+  })
+})
+
+test('in-flight AI waits fail closed on permission change or human takeover', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    const info = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-wait')
+    const record = registry.sessions.get(info.id)
+    record.cursors.set('ai', 0)
+
+    // Pattern wait: revocation before the matching output arrives.
+    const patternWait = registry.waitFor(info.id, {
+      until: 'pattern', pattern: 'SECRET', timeoutMs: 1000, actor: 'ai', owner: 'owner-wait',
+    })
+    registry.setAiAccess(info.id, 'wo', 'human', 'owner-wait')
+    registry.handleData(record, 'SECRET-AFTER-REVOKE\n')
+    const patternResult = await patternWait
+    assert.equal(patternResult.matched, false)
+    assert.equal(patternResult.reason, 'permission_changed')
+    assert.equal(String(patternResult.text).includes('SECRET'), false)
+    assert.equal(record.cursors.get('ai'), 0, 'a denied wait must not consume the reader cursor')
+
+    // Restore permission cannot retroactively authorize the same window.
+    registry.setAiAccess(info.id, 'rw', 'human', 'owner-wait')
+    const restoredWait = registry.waitFor(info.id, {
+      until: 'pattern', pattern: 'LATE', timeoutMs: 1000, actor: 'ai', owner: 'owner-wait',
+    })
+    registry.setAiAccess(info.id, 'wo', 'human', 'owner-wait')
+    registry.setAiAccess(info.id, 'rw', 'human', 'owner-wait')
+    registry.handleData(record, 'LATE-SECRET\n')
+    const restored = await restoredWait
+    assert.equal(restored.matched, false)
+    assert.equal(restored.reason, 'permission_changed')
+    assert.equal(String(restored.text).includes('LATE-SECRET'), false)
+
+    // Human takeover invalidates an idle waiter even though aiAccess is rw.
+    const idleWait = registry.waitFor(info.id, { until: 'idle', idleMs: 40, timeoutMs: 1000, actor: 'ai', owner: 'owner-wait' })
+    registry.takeOver(info.id, 'human', 'owner-wait')
+    registry.handleData(record, 'HUMAN-INPUT-SECRET\n')
+    const idleResult = await idleWait
+    assert.equal(idleResult.matched, false)
+    assert.equal(idleResult.reason, 'permission_changed')
+    assert.equal(String(idleResult.text).includes('HUMAN-INPUT-SECRET'), false)
+
+    // Timeout path is denied too, without output.
+    registry.release(info.id, 'human', 'owner-wait')
+    const timeoutWait = registry.waitFor(info.id, {
+      until: 'pattern', pattern: 'NEVER', timeoutMs: 40, actor: 'ai', owner: 'owner-wait',
+    })
+    registry.setAiAccess(info.id, 'wo', 'human', 'owner-wait')
+    registry.handleData(record, 'TIMEOUT-SECRET\n')
+    const timeoutResult = await timeoutWait
+    assert.equal(timeoutResult.matched, false)
+    assert.equal(timeoutResult.reason, 'permission_changed')
+    assert.equal(String(timeoutResult.text).includes('TIMEOUT-SECRET'), false)
+
+    // A human waiter is unaffected by the AI-only guard.
+    const humanWait = registry.waitFor(info.id, { until: 'pattern', pattern: 'HUMAN-OK', timeoutMs: 1000, actor: 'human', owner: 'owner-wait' })
+    registry.handleData(record, 'HUMAN-OK\n')
+    const humanResult = await humanWait
+    assert.equal(humanResult.matched, true)
+    assert.equal(String(humanResult.text).includes('HUMAN-OK'), true)
+    await registry.dispose()
+  })
+})
+
+
+/* ------------------------------------------------------------------ *
+ * 13. Connect target, history page owner binding and live historyId.
+ * ------------------------------------------------------------------ */
+
+test('AI profile connects cannot override the saved target with profile credentials', async () => {
+  await withDir(async (dir) => {
+    let secretsRead = 0
+    const profiles = {
+      async get(id) {
+        if (id !== 'saved') return undefined
+        return { id: 'saved', name: 'saved', transport: 'ssh', host: 'saved.example', port: 2222, username: 'saved-user', authType: 'password' }
+      },
+      async secretsFor(id) {
+        secretsRead += 1
+        return id === 'saved' ? { password: 'SAVED-PASSWORD' } : {}
+      },
+      async connectionFor(id) {
+        return { auth: { type: 'password', password: 'SAVED-PASSWORD' } }
+      },
+    }
+    const registry = new SessionRegistry({
+      config: resolveConfig({ ...DEFAULT_CONFIG, aiAccessDefault: 'rw', aiAutoLock: false }),
+      profiles,
+      dataDir: dir,
+      log: () => {},
+      autolog: noopAutolog(),
+    })
+    for (const override of [
+      { transport: 'telnet' },
+      { host: 'evil.example' },
+      { port: 22 },
+      { username: 'evil' },
+      { authType: 'agent' },
+    ]) {
+      await assert.rejects(
+        () => registry.resolveTarget({ profileId: 'saved', ...override }, 'ai'),
+        (error) => {
+          assert.equal(error?.code, 'AI_PROFILE_TARGET_DENIED')
+          return true
+        },
+      )
+    }
+    assert.equal(secretsRead, 0, 'overrides must be rejected before reading profile secrets')
+    const aiTarget = await registry.resolveTarget({ profileId: 'saved', title: 'ok' }, 'ai')
+    assert.equal(aiTarget.host, 'saved.example')
+    assert.equal(aiTarget.port, 2222)
+    assert.equal(aiTarget.username, 'saved-user')
+    assert.equal(aiTarget.auth.password, 'SAVED-PASSWORD')
+
+    await assert.rejects(
+      () => registry.create({ profileId: 'saved', host: 'evil.example' }, 'ai', 'owner-a'),
+      (error) => {
+        assert.equal(error?.code, 'AI_PROFILE_TARGET_DENIED')
+        return true
+      },
+    )
+
+    // Human form overrides remain the existing behaviour (saved password is
+    // reused for the human-edited target).
+    const humanTarget = await registry.resolveTarget({ profileId: 'saved', host: 'human.example', port: 2200, username: 'human' }, 'human')
+    assert.equal(humanTarget.host, 'human.example')
+    assert.equal(humanTarget.port, 2200)
+    assert.equal(humanTarget.auth.password, 'SAVED-PASSWORD')
+    await registry.dispose()
+  })
+})
+
+test('historySessionsPage stays owner-scoped through the facade and the real RPC route', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    for (const [id, owner] of [['st-a', 'owner-a'], ['st-b', 'owner-b']]) {
+      await store.openSession({
+        id, owner, title: id, transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+      })
+      store.appendChunk(id, `${id}\n`, T0 + 1, owner)
+      await store.closeSession(id, { owner, closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    }
+    await settle(store)
+    const registry = makeRegistry(dir, store)
+    const scoped = ownerScopedRegistry(registry, 'owner-a')
+    const page = await scoped.historySessionsPage({ actor: 'human' })
+    assert.deepEqual(page.sessions.map((entry) => entry.id), ['st-a'])
+
+    let handler
+    const webCtx = {
+      effect(run) { run() },
+      webServer: { register(definition) { handler = definition.handler } },
+      connection: { admit: () => ({}) },
+    }
+    registerRoutes(webCtx, {
+      config: resolveConfig({ ...DEFAULT_CONFIG, routePath: '/aiterm' }),
+      registry,
+      profiles: {},
+      log: () => {},
+    })
+    assert.equal(typeof handler, 'function')
+    const request = {
+      method: 'POST',
+      url: '/aiterm/rpc',
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.from(JSON.stringify({ method: 'history.sessions', params: { owner: 'owner-a' } }))
+      },
+    }
+    let resolveDone
+    const done = new Promise((resolve) => { resolveDone = resolve })
+    const response = {
+      status: 0,
+      body: '',
+      writeHead(status) { this.status = status },
+      end(chunk) { this.body = chunk === undefined ? '' : String(chunk); resolveDone() },
+    }
+    handler(request, response)
+    await done
+    const parsed = JSON.parse(response.body)
+    assert.equal(parsed.ok, true)
+    assert.deepEqual(parsed.result.sessions.map((entry) => entry.id), ['st-a'])
+    await registry.dispose()
+  })
+})
+
+test('a historyId-only AI query resolves an active rw live incarnation', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    const info = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-live')
+    const record = registry.sessions.get(info.id)
+    await record.historyReady
+    assert.ok(record.historyId)
+    registry.handleData(record, 'LIVE-ID-ONLY\n')
+    const result = await registry.historyQuery({ historyId: record.historyId, owner: 'owner-live', actor: 'ai', search: 'LIVE-ID-ONLY' })
+    assert.equal(result.matches.length, 1, 'an active rw incarnation must not be judged by its missing close metadata')
+    registry.setAiAccess(record.id, 'wo', 'human', 'owner-live')
+    await rejectsWithCode(
+      () => registry.historyQuery({ historyId: record.historyId, owner: 'owner-live', actor: 'ai' }),
+      'AI_READ_DENIED',
+    )
+    await registry.dispose()
+  })
+})
+
+
+test('synthetic local ssh2 capture: AI profile connect uses only the saved target/password', async () => {
+  await withDir(async (dir) => {
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+    })
+    /** @type {Array<{ username: string, password?: string }>} */
+    const attempts = []
+    const server = new ssh2.Server({ hostKeys: [privateKey] }, (client) => {
+      client.on('authentication', (ctx) => {
+        attempts.push({ username: ctx.username, password: ctx.method === 'password' ? ctx.password : undefined })
+        if (ctx.method === 'password' && ctx.username === 'saved-user' && ctx.password === 'SAVED-PASSWORD') ctx.accept()
+        else ctx.reject(['password'])
+      })
+      client.on('ready', () => {
+        client.on('session', (accept) => {
+          const session = accept()
+          session.on('pty', (acceptPty) => { try { acceptPty() } catch { /* test server */ } })
+          session.on('shell', (acceptShell) => {
+            const stream = acceptShell()
+            stream.write('synthetic-banner\n')
+          })
+        })
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    const profiles = {
+      async get(id) {
+        return id === 'saved' ? { id: 'saved', name: 'saved', transport: 'ssh', host: '127.0.0.1', port, username: 'saved-user', authType: 'password' } : undefined
+      },
+      async secretsFor() { return { password: 'SAVED-PASSWORD' } },
+      async connectionFor() { return { auth: { type: 'password', password: 'SAVED-PASSWORD' } } },
+    }
+    const registry = new SessionRegistry({
+      config: resolveConfig({ ...DEFAULT_CONFIG, aiAccessDefault: 'rw', aiAutoLock: false, knownHostsPolicy: 'insecure', connectTimeoutMs: 3000 }),
+      profiles,
+      dataDir: dir,
+      log: () => {},
+      autolog: noopAutolog(),
+    })
+    try {
+      await assert.rejects(
+        () => registry.create({ profileId: 'saved', host: '127.0.0.1', port: port + 1 }, 'ai', 'owner-a'),
+        (error) => {
+          assert.equal(error?.code, 'AI_PROFILE_TARGET_DENIED')
+          return true
+        },
+      )
+      assert.equal(attempts.length, 0, 'a rejected override must not touch the synthetic server')
+
+      const created = await registry.create({ profileId: 'saved' }, 'ai', 'owner-a')
+      assert.equal(created.state, 'open')
+      const passwordAttempts = attempts.filter((attempt) => attempt.password !== undefined)
+      assert.equal(passwordAttempts.length, 1)
+      assert.deepEqual(passwordAttempts[0], { username: 'saved-user', password: 'SAVED-PASSWORD' })
+    } finally {
+      await registry.dispose()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
+})
+
+test('maxSessions cap uses the same recent-activity order as retention', async () => {
+  await withDir(async (dir) => {
+    const old = Date.now() - 3 * 24 * 60 * 60 * 1000
+    const store = makeStore(dir, { maxSessions: 1, retentionMs: 30 * 24 * 60 * 60 * 1000 })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'recent-close-old-output', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: old,
+    })
+    store.appendChunk('st-1', 'OLD-OUTPUT\n', old + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: Date.now(), permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const firstJournal = store.journalForSync('st-1', { owner: 'owner-a', actor: 'human' })
+
+    await store.openSession({
+      id: 'st-2', owner: 'owner-a', title: 'old-close-new-output', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: old,
+    })
+    store.appendChunk('st-2', 'NEW-OUTPUT\n', old + 1000, 'owner-a')
+    await store.closeSession('st-2', { owner: 'owner-a', closedAt: old + 2, permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const secondJournal = store.journalForSync('st-2', { owner: 'owner-a', actor: 'human' })
+    await utimes(secondJournal, new Date(old), new Date(old))
+
+    await store.pruneRecordings(Date.now())
+    assert.ok(await stat(firstJournal).then(() => true, () => false), 'the recently closed journal must survive the cap')
+    assert.equal(await stat(secondJournal).then(() => true, () => false), false, 'the genuinely older journal is removed')
+    await store.dispose()
+  })
+})
+
+test('owner-filtered paging exposes true totals and export aggregates the cap', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    for (const [id, owner] of [['st-a1', 'owner-a'], ['st-b1', 'owner-b'], ['st-b2', 'owner-b'], ['st-b3', 'owner-b']]) {
+      await store.openSession({
+        id, owner, title: id, transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+      })
+      store.appendChunk(id, `${id}\n`, T0 + 1, owner)
+      await store.closeSession(id, { owner, closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    }
+    await settle(store)
+    const a = await store.listRecordingsPage({ owner: 'owner-a', limit: 1 })
+    assert.equal(a.total, 1)
+    assert.equal(a.recordings.length, 1)
+    assert.equal(a.truncated, false)
+    const b = await store.listRecordingsPage({ owner: 'owner-b', limit: 1 })
+    assert.equal(b.total, 3, 'other owners must not affect the total')
+    assert.equal(b.recordings.length, 1)
+    assert.equal(b.truncated, true)
+
+    const journal = join(dir, 'one.ndjson')
+    await writeFile(journal, `${JSON.stringify({ t: T0, d: payload('AGG\n') })}\n`, { mode: 0o600 })
+    const fake = {
+      fileFor: () => journal,
+      flush: async () => {},
+      listSessions: async () => [
+        { id: 'st-1', title: '1', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 },
+        { id: 'st-2', title: '2', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 },
+      ],
+    }
+    const result = await exportSessions({ historyStore: fake, dir: join(dir, 'cap'), all: true, maxFiles: 1 })
+    assert.equal(result.files.length, 1)
+    assert.deepEqual(result.omitted, { count: 1, limit: 1, reason: 'EXPORT_LIMIT' })
+
+    const many = {
+      fileFor: () => undefined,
+      flush: async () => {},
+      listSessions: async () => Array.from({ length: 150 }, (_, index) => ({
+        id: `st-${index}`, title: 'x', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+      })),
+    }
+    const skippedResult = await exportSessions({ historyStore: many, dir: join(dir, 'many'), all: true })
+    assert.equal(skippedResult.files.length, 0)
+    assert.equal(skippedResult.skipped.length, 101, '100 details plus one aggregate')
+    const aggregate = skippedResult.skipped[skippedResult.skipped.length - 1]
+    assert.equal(aggregate.code, 'SKIPPED_AGGREGATE')
+    assert.equal(aggregate.count, 50)
+    await store.dispose()
+  })
+})
+
+
+test('legacy listing exposes total/truncated and offset paging', async () => {
+  await withDir(async (dir) => {
+    const entries = []
+    for (let index = 1; index <= 3; index += 1) {
+      const id = `st-${index}`
+      await writeFile(join(dir, `${id}.ndjson`), `${JSON.stringify({ t: T0 + index, d: payload(`${id}\n`) })}\n`, { mode: 0o600 })
+      entries.push({ id, title: id, transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + index, lastTs: T0 + index })
+    }
+    await writeFile(join(dir, 'index.json'), `${JSON.stringify({ version: 1, sessions: entries })}\n`, { mode: 0o600 })
+    const store = makeStore(dir)
+    await store.init()
+    const first = await store.listLegacySessionsPage({ limit: 1, offset: 0 })
+    assert.equal(first.total, 3)
+    assert.equal(first.truncated, true)
+    assert.equal(first.sessions.length, 1)
+    const third = await store.listLegacySessionsPage({ limit: 1, offset: 2 })
+    assert.equal(third.total, 3)
+    assert.equal(third.truncated, false)
+    assert.equal(third.sessions[0].id, 'st-1')
+    const registry = makeRegistry(dir, store)
+    const page = await registry.legacyHistorySessionsPage({ actor: 'human', limit: 1, offset: 1 })
+    assert.equal(page.total, 3)
+    assert.equal(page.truncated, true)
+    await registry.dispose()
+  })
+})
+
+test('closing an AI waiter after a permission change denies its pending output', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    const info = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-close')
+    const record = registry.sessions.get(info.id)
+    const wait = registry.waitFor(info.id, {
+      until: 'pattern', pattern: 'CLOSE-SECRET', timeoutMs: 1000, actor: 'ai', owner: 'owner-close',
+    })
+    registry.setAiAccess(info.id, 'wo', 'human', 'owner-close')
+    registry.handleData(record, 'CLOSE-SECRET\n')
+    await registry.close(info.id, 'abort wait', 'human', 'owner-close')
+    const result = await wait
+    assert.equal(result.matched, false)
+    assert.equal(result.reason, 'permission_changed')
+    assert.equal(String(result.text), '')
+    await registry.dispose()
   })
 })

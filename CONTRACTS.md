@@ -393,7 +393,7 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-> **v8 安全变更（0.5.6）**：
+> **v8 安全变更（0.5.7）**：
 > 1. 会话 id（`st-N`）不再每次启动从 1 开始。历史目录的 `.ids/st-N` 用 `open(..., 'wx')`
 >    原子预留，跨重启、跨并发宿主续号；分配前还会跳过已有 journal 或已有 `<id>.log` 的 id。
 > 2. 每次 `openSession()` 仍用 `open(..., 'wx')` 独占创建新的 incarnation journal
@@ -459,6 +459,7 @@ export class HistoryStore {
 - 任何磁盘错误只记 warn，绝不影响终端会话。**append 失败时批次放回 pending**，close 只有在
   pending 清空后才删除 writer 并追加关闭元数据；否则保留 state 供 `flush()`/`dispose()` 重试，
   且关闭权限保持未知（AI fail closed）。
+- append 以 batch 为事务：每批先记录起始文件偏移，逐行 write/sync；失败时 truncate 回起始偏移再重试。rollback 失败 → `corrupt=true`，停止写入且不写 close 权限（fail closed，不误报 healthy）。
 - pending 有界：`maxPendingBytes` 默认 1 MiB/会话（1024..64 MiB）。超限时**从最旧未落盘记录开始丢弃**，
   单个超大 chunk 直接丢弃；`stats()` 暴露 `pendingBytes/droppedBytes/writeFailures/retryDelayMs/degraded`。
   `degraded` 一旦发生过丢弃就保持为 true。失败日志按 60s 节流，重试指数退避到 60s。**这不是零丢失语义**。
@@ -487,8 +488,10 @@ export class HistoryStore {
   `index.json` 的 last-writer-wins 不影响归属判定。
 - **prune 保守策略**：没有跨进程活动租约，因此**无 close 元数据的 journal 永不自动删除**（可能是
   另一进程的 live writer，也可能是 crash 数据；保留优于误删）。只有带 close 元数据的 journal 才按
-  `max(lastTs, closedAt, stat.mtime)` 判老；大尾行/最近写入不会因旧 `lastTs` 被误删。不可验证租约时
+  `max(lastTs, closedAt, stat.mtime)` 判老；大尾行/最近写入不会因旧 `lastTs` 被误删。maxSessions
+  裁剪使用同一 activity 排序，但仍按数量执行：总量超限时可能裁掉近期但排序靠后的日志。不可验证租约时
   不承诺多 Host retention 一致；unclosed 可能长期占用磁盘。
+- 等待读取：AI waiter 在创建时记录 `PermissionState.revision`。等待期间任何 aiAccess/lock 变化（含 human takeover、恢复权限）都会以 `permission_changed` 结束且返回空 text、不更新 cursor；pattern/idle/timeout/exit 都走同一检查。
 - 审计：write/deny **不记录任何输入原文**，只保留 action/source/code/byteLength 等元数据。
   旧内存审计可能含历史原文；`audit({actor:'ai'})` 在返回前把所有 `detail` 脱敏为
   `<action>:redacted`（human 视图保留原值）。live 会话的 history slice/export 写入会话审计环；
@@ -571,7 +574,7 @@ export class ScriptStore {
 | `aiterm_screen` | `{ sessionId, changedOnly?, maxLines?, cursor? }` | 可见屏幕文本（去空行、可只回变化行），返回 `cursor`/`atPrompt`/`unchanged` |
 | `aiterm_screenshot` | `{ sessionId }` | **兼容别名**，载荷精简为 `{ text, cols, rows, cursor, atPrompt, session }`（不再重复 `screen`+`text`） |
 | `aiterm_wait` | `{ sessionId, until?, pattern?, idleMs?, timeoutMs?, cursor?, includeOutput? }` | `until`: `idle`(默认)/`pattern`/`exit` |
-| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`）；否则返回匹配/片段 |
+| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, offset? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`；`truncated/total` 与 offset 分页）；否则返回匹配/片段 |
 | `aiterm_batch` | `{ steps, targets?, stopOnError?, maxTotalMs?, parallel?, label? }` | §11.2 |
 | `aiterm_script_list` | `{}` | 列出脚本 |
 | `aiterm_script_run` | `{ name, params?, sessionId?, targets? }` | 执行脚本（等价 batch，label=`script:<name>`） |
@@ -594,10 +597,10 @@ export class ScriptStore {
 |---|---|---|
 | `read.delta` | `{ id, cursor?, maxBytes? }` | `{ text, cursor, newBytes, atPrompt }` |
 | `read.screen` | `{ id, changedOnly?, maxLines? }` | `{ text, changedLines, cursor, atPrompt, unchanged }` |
-| `history.sessions` | `{ limit?, since?, until?, owner? }` | `{ sessions: CatalogEntry[] }`（按 owner 过滤；同一 id 的多个 incarnation 逐条返回，各带 `historyId`） |
+| `history.sessions` | `{ limit?, offset?, since?, until?, owner? }` | `{ sessions: CatalogEntry[], truncated, total }`（先按 owner 过滤再分页；同一 id 的多个 incarnation 逐条返回，各带 `historyId`） |
 | `history.query` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }`（已关闭会话同样按 owner + 关闭权限判定；`historyId` 精确指定 incarnation） |
-| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files: [{ sessionId, historyId?, path, bytes, lines }], skipped: [{ sessionId, historyId?, code, message }] }`（`all` 覆盖本 owner 且当前 actor 可读的**每个** incarnation；显式源文件缺失 → `SESSION_NOT_FOUND`） |
-| `history.legacy.sessions` | `{ limit?, since?, until? }` | `{ sessions: CatalogEntry[] }`（**仅人工**；无归属旧数据） |
+| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files, skipped, omitted? }`（`all` 覆盖本 owner 且当前 actor 可读的**每个** incarnation，最多 5000；超出用 `omitted:{count,limit,reason}` 汇总；skipped 明细最多 100 条+聚合；显式源文件缺失 → `SESSION_NOT_FOUND`） |
+| `history.legacy.sessions` | `{ limit?, offset?, since?, until? }` | `{ sessions: CatalogEntry[], truncated, total }`（**仅人工**；无归属旧数据可分页恢复） |
 | `history.legacy.query` | `{ sessionId, since?, until?, search?, context?, maxMatches?, maxBytes? }` | history.query 同形（**仅人工**，不改写旧文件） |
 | `history.legacy.export` | `{ sessionId, since?, until? }` | `{ dir, files }`（**仅人工**；旧文件不改不删） |
 | `scripts.list` | `{}` | `{ scripts: ScriptSummary[] }` |
@@ -640,6 +643,11 @@ scriptsDir: scripts                           # <dataDir> 下脚本目录名
 ---
 
 # v3 增补：配置管理与脚本语言
+
+> **AI + profileId 目标约束（0.5.7）**：AI 调用带 `profileId` 的 connect 时必须只传
+> profileId（及 title/cols/rows）；`transport`/`host`/`port`/`username`/`authType` 任一覆盖都会在
+> 读取 profile 密钥之前以 `AI_PROFILE_TARGET_DENIED` 拒绝，避免保存的密码/私钥被发往 AI 指定的目标。
+> 人工在表单里覆盖地址仍沿用原有行为（保存密码复用于人工编辑的目标）。
 
 ## 13. 配置（profile）管理
 
