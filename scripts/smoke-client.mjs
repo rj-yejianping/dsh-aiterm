@@ -2486,6 +2486,7 @@ await closePanelViaBar()
     assert.ok(call, 'exporting must call history.export')
     assert.equal(call.params.all, undefined, 'exporting one session must not ask for all')
     assert.ok(call.params.sessionId, 'exporting one session must name it')
+    assert.equal(call.params.owner, 'session-smoke', 'history.export must be scoped to the DSH session')
     const flat = textOf(lastTree)
     assert.ok(flat.includes('-web-1-'), 'the exported file path must be rendered, got: ' + flat.slice(-200))
     assert.ok(flat.includes(dict('historyExportLines').split('{')[0]), 'the exported line count must render')
@@ -2498,6 +2499,7 @@ await closePanelViaBar()
     const call = scene.rpcCalls.slice(mark).find((entry) => entry.method === 'history.export')
     assert.ok(call, 'export-all must call history.export')
     assert.equal(call.params.all, true, 'export-all must pass all: true')
+    assert.equal(call.params.owner, 'session-smoke', 'export-all must be scoped to the DSH session')
   }
 
   // Flip the auto-log switch on.

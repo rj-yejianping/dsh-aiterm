@@ -59,9 +59,9 @@ export function currentOwner() {
 /**
  * Whether a method scopes its data to one AI session.
  *
- * Profiles, saved scripts and the auto-log switch are host-wide settings, and
- * `history.export all` is an explicitly cross-session operation, so those
- * never receive an owner.
+ * Profiles, saved scripts and the auto-log switch are host-wide settings, so
+ * those never receive an owner. History export is owner-scoped: `all` means
+ * every session owned by the current DSH session, never every journal on disk.
  *
  * @param method - RPC method name.
  * @returns true when the owner should be attached.
@@ -70,6 +70,7 @@ function ownerScoped(method) {
   return /^(sessions|permission|lock|read|audit)\./.test(method)
     || method === 'history.sessions'
     || method === 'history.query'
+    || method === 'history.export'
     || method === 'batch.run'
 }
 

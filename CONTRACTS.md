@@ -393,41 +393,56 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-- `<sessionId>.ndjson`：每行 `{"t":<epoch ms>,"d":"<base64 UTF-8>"}`，一次会话一个文件。
-- `index.json`：`{ "version": 1, "sessions": [CatalogEntry] }`。
-- `CatalogEntry`：`{ id, title, transport, host, port, username, createdAt, closedAt?, bytes, lastTs }`。
+> **v7 安全变更（0.5.3）**：会话 id（`st-N`）在插件重载后仍会从头计数，因此日志文件名不再
+> 只由会话 id 决定。每次 `openSession()` 都用 `open(file, 'wx')` **原子独占**创建新的
+> incarnation 文件，绝不重新打开/追加旧文件；owner 与关闭权限随文件私有保存，不依赖可被
+> 其他宿主实例覆盖的 `index.json`。升级前没有归属元数据的旧文件原样保留、对 AI fail closed。
+
+- 新格式：`<sessionId>~<uuid>.ndjson`
+  - 第一行：`{"_aiterm":"journal","version":1,"id","owner","title","transport","host","port","username","createdAt"}`；`owner` 为 DSH 会话 id，或显式 `null`（无归属桶）。
+  - 数据行：`{"t":<epoch ms>,"d":"<base64 UTF-8>"}`。
+  - `closeSession()` 追加：`{"_aiterm":"close","version":1,"closedAt","bytes","lastTs","aiAccess"?}`；`aiAccess` 缺失表示关闭权限未知（AI fail closed）。
+  - 文件头缺失/损坏 → unattributed：不列出、AI 不可读；文件不动。
+- 旧格式（迁移前）：`<sessionId>.ndjson`（无文件头），仅从 `index.json` 取得公开目录信息；永不改写、永不被保留策略删除。
+- `index.json`：`{ "version": 1, "sessions": [CatalogEntry] }`，**只读旧数据**；新日志通过扫描文件头恢复。索引中的 `owner` 等字段不可信、不参与鉴权。
+- `CatalogEntry`：`{ id, title, transport, host, port, username, createdAt, closedAt?, bytes, lastTs }`；私有字段 `owner`、`aiAccess`、journal path 永不出现在工具/浏览器载荷。
 
 ```js
 export class HistoryStore {
   constructor(options: {
     dir: string,
-    retentionMs: number,          // 默认 24h
+    retentionMs: number,          // 默认 24h（只作用于新格式日志）
     maxBytesPerSession: number,   // 默认 8 MiB
     maxSessions: number,          // 默认 100
     flushIntervalMs?: number,     // 默认 250
     log?: (level: string, message: string) => void,
   })
-  async init(): Promise<void>                       // 建目录、读 index、按保留策略清理
-  async openSession(meta: { id, title, transport, host, port, username, createdAt }): Promise<void>
-  appendChunk(sessionId: string, text: string, at?: number): void   // 缓冲后异步落盘，不抛
+  async init(): Promise<void>
+  async openSession(meta: { id, owner, title, transport, host, port, username, createdAt }): Promise<boolean>
+  appendChunk(sessionId: string, text: string, at?: number, owner?: string | null): void
   async flush(sessionId?: string): Promise<void>
-  async closeSession(sessionId: string, info?: { closedAt?: number }): Promise<void>
-  async listSessions(query?: { limit?: number, since?: number, until?: number }): Promise<CatalogEntry[]>
-  /** 查询已关闭/历史会话（也可查仍活跃会话，调用方优先用 OutputLog）。 */
-  async query(query: {
-    sessionId: string, since?: number, until?: number, search?: string,
-    context?: number, maxMatches?: number, maxBytes?: number,
-  }): Promise<{ matches: Array<{ at: number, line: string, before: string[], after: string[] }>, scannedBytes: number, truncated: boolean, entry?: CatalogEntry }>
-  async prune(now?: number): Promise<void>
+  async whenIdle(): Promise<void>
+  async closeSession(sessionId: string, info?: { closedAt?: number, permission?: { aiAccess?: string }, owner?: string | null }): Promise<void>
+  async listRecordings(query?): Promise<Recording[]>      // 私有 owner/aiAccess/journal 字段
+  async listLegacySessions(query?): Promise<CatalogEntry[]>
+  async resolveForRead(sessionId, owner, actor): Promise<{ kind: 'attributed', recording } | { kind: 'legacy', entry } | undefined>
+  canAiRead(recording): boolean                            // 仅关闭权限为 ro/rw 才为 true
+  journalForSync(sessionId, { owner, actor }): string | undefined
+  activeJournal(sessionId): string | undefined
+  async queryRecording(recording, query): Promise<QueryResult>
+  async queryLegacy(entry, query): Promise<QueryResult>
+  async query(query): Promise<QueryResult>                 // 便捷封装；无法判定时返回空
+  async prune(now?: number): Promise<void>                 // 只清理新格式日志
   async dispose(): Promise<void>
 }
 ```
 
 规则：
-- `appendChunk` 只写内存缓冲；`flushIntervalMs` 到点或缓冲超过 64 KiB 时追加写文件（`appendFile`）。
-- 任何磁盘错误只记 warn，绝不影响终端会话。
-- 单文件超过 `maxBytesPerSession` 时截断（重写为尾部内容），并在 catalog 记 `truncatedAt`。
-- `query` 最多扫描文件末尾 `maxBytes`（默认 8 MiB）字节，`truncated` 表示是否因上限截断。
+- `appendChunk` 只写内存缓冲；`flushIntervalMs` 到点或缓冲超过 64 KiB 时追加写文件（`appendFile`）。只写自己的 incarnation。
+- 任何磁盘错误只记 warn，绝不影响终端会话；关闭元数据写失败时进程内仍按已知权限处理，重启后未知权限 → AI fail closed。
+- 单文件超过 `maxBytesPerSession` 时截断为尾部内容，**必须保留第一行文件头**；文件头无法确认时放弃截断（fail closed）。
+- 读取/导出先按 owner 匹配文件头；AI 还要求关闭权限为 `ro`/`rw`。legacy 只允许显式 `actor:'human', owner:null` 的历史桶读取，且必须能在 `index.json` 中存在（孤儿文件不暴露）。
+- 多个 `HistoryStore` 并发/重载/旧实例延迟 flush 时，`wx` 预留与独立文件名保证不串写；`index.json` 的 last-writer-wins 不影响归属判定。
 
 ## 11. 批量与脚本（`lib/host/batch.js`、`lib/host/scripts.js`）
 
@@ -529,8 +544,9 @@ export class ScriptStore {
 |---|---|---|
 | `read.delta` | `{ id, cursor?, maxBytes? }` | `{ text, cursor, newBytes, atPrompt }` |
 | `read.screen` | `{ id, changedOnly?, maxLines? }` | `{ text, changedLines, cursor, atPrompt, unchanged }` |
-| `history.sessions` | `{ limit?, since?, until? }` | `{ sessions: CatalogEntry[] }` |
-| `history.query` | `{ sessionId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }` |
+| `history.sessions` | `{ limit?, since?, until?, owner? }` | `{ sessions: CatalogEntry[] }`（按 owner 过滤；无归属旧数据只对 `owner:null` 的人工视图可见） |
+| `history.query` | `{ sessionId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }`（已关闭会话同样按 owner + 关闭权限判定） |
+| `history.export` | `{ sessionId?, all?, since?, until?, owner? }` | `{ dir, files: [{ sessionId, path, bytes, lines }] }`（`all` 只覆盖本 owner 且 AI 可读的会话） |
 | `scripts.list` | `{}` | `{ scripts: ScriptSummary[] }` |
 | `scripts.save` | `{ script }` | `{ script: ScriptSummary }`（human only） |
 | `scripts.delete` | `{ name }` | `{ ok: boolean }`（human only） |
