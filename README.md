@@ -125,17 +125,24 @@ sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 | `aiterm_disconnect` | 断开但保留会话（可重连） |
 | `aiterm_reconnect` | 重连该会话（同一 id，历史保留） |
 | `aiterm_close` | 关闭会话（终止并从列表移除） |
+| `aiterm_export` | 把会话输出（含已关闭会话）导出为 Host 上的文本日志文件 |
+| `aiterm_autolog` | 查询/开关自动写日志文件（默认关闭，开关持久化） |
 
 AI 不能提供密码或私钥：需要密码/私钥的连接必须使用保存的 profile，由 Host 侧解析。
 
+以上是 `toolDisclosure: full`（默认）下的完整工具面。`progressive` 会额外常驻一个发现入口
+`aiterm_discover`（它不属于上面任何业务分组，也不接触终端），其余工具的注册与执行完全不变，
+只是要按组展开后才在下一步可见——见下方「工具渐进披露」。
+
 ## 配置
 
-在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 覆盖本插件行（合并语义：给整段 `config`）：
+在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 覆盖本插件行（只需写要覆盖的键，未给出的取默认值）：
 
 ```yaml
 - id: aiterm
   name: 'dsh-aiterm'
   config:
+    toolDisclosure: full       # full（默认，21 个工具全量注册）| progressive（先发现、按组展开）
     aiAccessDefault: ro        # 新会话默认 AI 权限：ro | wo | rw
     aiAutoLock: true           # AI 写入时是否自动取得控制权
     aiLockIdleMs: 30000        # AI 控制权空闲自动释放时间
@@ -151,7 +158,71 @@ AI 不能提供密码或私钥：需要密码/私钥的连接必须使用保存�
     knownHostsPolicy: accept-new   # accept-new | strict | insecure
     terminalType: xterm-256color
     # v2 读取 / 历史 / 脚本
-    promptPattern: '(?:^|[\s\])])[#$%>❯»]\s*
+    promptPattern: '(?:^|[\s\])])[#$%>❯»]\s*'
+```
+
+`toolDisclosure` 只在插件加载时读取（见下方「工具渐进披露」）；切换取值会重载插件行，
+**可能关闭当前终端**。其余配置项与默认值、取值范围见 `CONTRACTS.md`。
+
+## 工具渐进披露（`toolDisclosure: progressive`）
+
+默认的 `full` 保持历史行为：21 个 `aiterm_*` 工具对每个 Agent **无条件**注册，参数、
+描述、执行体、终端 owner 和权限判定全部不变。
+
+改成 `progressive` 后，只常驻一个发现入口 `aiterm_discover`；其余工具仍按原名注册，
+但附带一个**步骤级**条件：只有当前模型步骤的 Agent 已展开对应分组时才进入该步骤的
+工具快照。发现入口本身不接受任何终端操作，也不改变权限。
+
+| 分组 | 成员 | 何时可用 |
+| --- | --- | --- |
+| `session` | `list` / `status` / `read` / `screen` / `screenshot` / `wait` / `send` / `release_control` | 展开 `session` 后的**下一个**模型步骤 |
+| `history` | `history` / `audit` / `export` | 展开 `history` 后的下一个步骤 |
+| `automation` | `batch` / `script_list` / `script_save` / `script_run` | 展开 `automation` 后的下一个步骤 |
+| `management` | `connect` / `disconnect` / `reconnect` / `resize` / `close` / `autolog` | 展开 `management` 后的下一个步骤 |
+
+> 表中的名字省略了 `aiterm_` 前缀，例如 `session.list` 即 `aiterm_list`。
+
+用法（模型侧）：
+
+1. 第一步调用 `aiterm_discover`（不传参数）：返回当前模式、四组名称、当前 Agent 可见的
+   工具、已展开分组、组间依赖提示。
+2. 调用 `aiterm_discover { "group": "session" }` 展开一组；再传其他组可继续展开。
+   展开是**幂等**的，重复调用不会报错。
+3. 从**下一步**开始，该组工具才可调用；同一步里先发现再调用会得到 `UNKNOWN_TOOL`。
+4. 先展开 `session` 并 `aiterm_list` 拿到会话 id，history / automation / management
+   里的操作才有目标可用。
+
+边界与限制：
+
+- **每次展开只属于一个 Agent 对象**：子 Agent、fork、恢复（resume）或重开后的新 Agent
+  （即使复用同一个 session id）都从收起状态开始，不继承父级或旧对象的展开；`agent/disposed`
+  或插件卸载也会清空该 Agent 的展开状态。
+- **终端归属与展开身份是两件事**：终端按 DSH 会话 id（owner）隔离，展开按当前 Agent
+  对象记忆。恢复后的新 Agent 用同一 owner id 仍能看到同一终端，但必须重新展开；换一个
+  owner id 则照常 404，不会因为展开而越权。
+- **发现不是授权**：只读 / 只写（`aiAccess`）、人工接管（`lockOwner === 'human'`）、
+  AI 控制权、审计等判定仍在调用时由 Host 侧统一执行；展开前后拒绝码完全一致，
+  详见「AI 权限模型」。被其他工具限制隐藏的工具不会出现在发现结果里，展开也不会放宽它。
+- **非模型步骤不能直接执行条件工具**：条件工具只在 DSH 解析出的模型步骤快照里可用；
+  绕过步骤的直接调用（例如没有 `agent` 的 `tools.executable`、旧快照、后台脚本）在
+  progressive 下看不到它们，这是预期行为。需要脚本/批次能力时先展开对应分组。
+- **发现/展开不重启插件、不断开终端**：它们只改内存中的展开集合，正在运行的
+  `aiterm_wait` / `aiterm_batch` 等调用不会被中断。
+- **progressive 依赖模型遵守提示词**：模型若不先发现就直接猜工具名，会收到
+  `UNKNOWN_TOOL`；`full` 没有这个前置条件。工具多、模型上下文紧张时用 progressive。
+
+### 切换与回滚（会重载插件）
+
+`toolDisclosure` 是插件行配置，**没有热切换**。修改后 DSH 会重载/重启该插件行：
+
+- 插件持有的终端 registry 会随卸载销毁，**当前终端会被关闭**（不保留连接）；重新打开
+  后远端是新 shell（屏幕重置），但落盘的历史与审计仍可检索。
+- 展开状态只存在内存中，重载后全部清空；模型需要重新 `aiterm_discover`。
+- 建议在两次操作之间、没有正在跑的命令时切换；不要在长命令执行中切换。
+
+回滚：把 `toolDisclosure` 改回 `full`（或删掉该项）并重载插件/重启 DSH Web。`full`
+不注册 `aiterm_discover`，21 个工具恢复无条件注册；终端需要重新打开，历史、审计、
+脚本和 profile 都不受影响，无需迁移数据。
 
 ## 读取方式与 token 成本
 
@@ -395,7 +466,7 @@ npm install          # 运行时依赖 ssh2 / @xterm/headless / @xterm/addon-ser
 npm run build        # 从 client/**.jsx 重新生成 lib/client.js（模块 id 取自 package.json 的 name）
 npm run build:vendor # 重新打包 vendor/ssh2.cjs（需要 devDependency ssh2 + esbuild）
 npm run lint         # node --check 全部 Host 端源码
-npm test             # 客户端冒烟：槽位注册、locale 键、RPC 方法覆盖
+npm test             # Host 端 node:test（权限/披露等）+ 客户端冒烟：槽位注册、locale 键、RPC 方法覆盖
 ```
 
 改了 `client/` 一定要重新 `build` 并提交 `lib/client.js`：`lib/` 是仓库的一部分，
