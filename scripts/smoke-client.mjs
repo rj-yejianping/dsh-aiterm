@@ -2452,6 +2452,10 @@ await closePanelViaBar()
   let legacyRaceActive = false
   let reloadResolve = null
   let reloadActive = false
+  let legacyQueryResolve = null
+  let legacyQueryActive = false
+  let normalQueryResolve = null
+  let normalQueryActive = false
   scene.handlers.set('history.sessions', async (params) => {
     if (reloadActive && (params.offset === undefined || params.offset === 0)) {
       return await new Promise((resolve) => { reloadResolve = resolve })
@@ -2471,7 +2475,10 @@ await closePanelViaBar()
       snapshot: 'snap-1',
     }
   })
-  scene.handlers.set('history.query', async () => ({ matches: [], scannedBytes: 0 }))
+  scene.handlers.set('history.query', async () => {
+    if (normalQueryActive) return await new Promise((resolve) => { normalQueryResolve = resolve })
+    return { matches: [], scannedBytes: 0 }
+  })
   scene.handlers.set('history.legacy.sessions', async () => {
     if (legacyRaceActive) {
       return await new Promise((resolve) => { legacyRaceResolve = resolve })
@@ -2485,7 +2492,10 @@ await closePanelViaBar()
       snapshot: 'legacy-snap-1',
     }
   })
-  scene.handlers.set('history.legacy.query', async () => ({ matches: [{ at: now, line: 'LEGACY-OUT', before: [], after: [] }], scannedBytes: 50, truncated: false }))
+  scene.handlers.set('history.legacy.query', async () => {
+    if (legacyQueryActive) return await new Promise((resolve) => { legacyQueryResolve = resolve })
+    return { matches: [{ at: now, line: 'LEGACY-OUT', before: [], after: [] }], scannedBytes: 50, truncated: false }
+  })
   scene.handlers.set('history.legacy.export', async (params) => ({
     dir: '/home/u/.dsh/aiterm/exports',
     files: [{ sessionId: params.sessionId, path: '/home/u/.dsh/aiterm/exports/st-legacy-old-20261023.log', bytes: 64, lines: 2 }],
@@ -2578,6 +2588,37 @@ await closePanelViaBar()
     legacyRaceActive = false
     await clickNode(findButtonByText(dict('historyLegacyBack')), 'return from race legacy')
     await settle('returned to normal history')
+  }
+
+  // A delayed query from the old source must not paint into the new source.
+  {
+    await clickNode(findButtonByText(dict('historyLegacyEntry')), 'legacy for delayed query')
+    await settle('legacy query baseline')
+    legacyQueryActive = true
+    await clickNode(findButtonByText('old-unowned'), 'trigger delayed legacy query')
+    await settle('legacy query pending')
+    await clickNode(findButtonByText(dict('historyLegacyBack')), 'switch to normal while legacy query pending')
+    await settle('normal after legacy query')
+    assert.equal(typeof legacyQueryResolve, 'function')
+    legacyQueryResolve({ matches: [{ at: now, line: 'STALE-LEGACY-QUERY', before: [], after: [] }], scannedBytes: 10, truncated: false })
+    await settle('stale legacy query resolved')
+    assert.equal(textOf(lastTree).includes('STALE-LEGACY-QUERY'), false, 'a stale legacy query must not paint into normal')
+
+    normalQueryActive = true
+    const webOption = collect(lastTree, (node) => node.type === 'button' && node.props && node.props.role === 'option' && textOf(node).includes('web-1'))[0]
+    assert.ok(webOption, 'the normal history option must be selectable')
+    await clickNode(webOption, 'trigger delayed normal query')
+    await settle('normal query pending')
+    await clickNode(findButtonByText(dict('historyLegacyEntry')), 'switch to legacy while normal query pending')
+    await settle('legacy after normal query')
+    assert.equal(typeof normalQueryResolve, 'function')
+    normalQueryResolve({ matches: [{ at: now, line: 'STALE-NORMAL-QUERY', before: [], after: [] }], scannedBytes: 10, truncated: false })
+    await settle('stale normal query resolved')
+    assert.equal(textOf(lastTree).includes('STALE-NORMAL-QUERY'), false, 'a stale normal query must not paint into legacy')
+    legacyQueryActive = false
+    normalQueryActive = false
+    await clickNode(findButtonByText(dict('historyLegacyBack')), 'return after delayed query')
+    await settle('returned after delayed query')
   }
 
   // Explicit human-only legacy view: owner-bound GUI still reaches it.

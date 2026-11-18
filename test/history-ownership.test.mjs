@@ -2729,6 +2729,7 @@ test('history pagination uses a snapshot and reports a stale offset instead of s
     assert.equal(stale.stale, true)
     assert.deepEqual(stale.sessions, [])
     assert.equal(stale.truncated, true)
+    assert.equal(stale.limitReached, false, 'a stale response does not decide the source boundary')
     await registry.dispose()
   })
 })
@@ -2865,6 +2866,18 @@ test('aiterm_history render exposes the paging snapshot and stale/limit hints to
   const limit = textOf({ offset: 19999 }, { sessions: [], total: 20001, truncated: true, limitReached: true, snapshot: 'SNAP-3' })
   assert.ok(limit.includes('source limit'))
   assert.ok(limit.includes('snapshot: SNAP-3'))
+
+  const full = textOf({ offset: 0 }, {
+    sessions: [
+      { id: 'st-1', title: 't', transport: 'ssh', host: 'h', port: 22, createdAt: T0, bytes: 1 },
+      { id: 'st-2', title: 't2', transport: 'ssh', host: 'h', port: 22, createdAt: T0, bytes: 1 },
+    ],
+    total: 2,
+    truncated: false,
+    snapshot: 'SNAP-END',
+  })
+  assert.ok(full.includes('snapshot: SNAP-END'))
+  assert.equal(full.includes('To page'), false, 'a complete last page must not advertise another page')
 })
 
 test('source-limit paging stays usable until the fetched boundary and legacy total is not undercounted', async () => {

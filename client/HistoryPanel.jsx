@@ -401,6 +401,14 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   /** Load the normal owner-scoped list (also used when leaving legacy mode). */
   const loadNormal = async () => {
     const token = ++loadTokenRef.current
+    // Invalidate any in-flight legacy/normal query before the list reload so a
+    // late query cannot paint into the new source. Filters remain untouched.
+    requestRef.current += 1
+    setResult(null)
+    setQueryState('idle')
+    setQueryError(null)
+    setManualText(null)
+    setPattern(null)
     setLoadMoreBusy(false)
     setSessions([])
     setListTruncated(false)
