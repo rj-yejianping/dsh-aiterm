@@ -48,7 +48,7 @@
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "lint": "node --check lib/index.js && for f in lib/host/*.js lib/host/transports/*.js; do node --check \"$f\" || exit 1; done",
-    "test": "node scripts/smoke-client.mjs",
+    "test": "node --test test/*.test.mjs && node scripts/smoke-client.mjs",
     "build:vendor": "node scripts/build-vendor.mjs"
   },
   "dependencies": {
