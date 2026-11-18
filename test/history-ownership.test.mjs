@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { AutoLog } from '../lib/host/autolog.js'
+import { ProfileStore } from '../lib/host/profiles.js'
 import { DEFAULT_CONFIG, resolveConfig } from '../lib/host/config.js'
 import { exportSessions } from '../lib/host/exporter.js'
 import { HistoryStore } from '../lib/host/history-store.js'
@@ -1455,8 +1456,10 @@ test('the legacy view opens the legacy file even when a new incarnation shares i
     const registry = makeRegistry(dir, fresh)
     // The normal no-owner list must not show two ambiguous rows for one id;
     // the legacy file is reachable through the explicit legacy view instead.
-    const normal = await registry.historySessions({ actor: 'human', owner: null })
+    const page = await registry.historySessionsPage({ actor: 'human', owner: null })
+    const normal = page.sessions
     assert.equal(normal.filter((entry) => entry.id === 'st-1').length, 1)
+    assert.equal(page.total, 1, 'an index-only duplicate must not inflate the merged total')
     assert.ok(normal.find((entry) => entry.id === 'st-1')?.historyId)
     const legacyHits = await registry.legacyHistoryQuery({ actor: 'human', sessionId: 'st-1', search: 'LEGACY-ONLY' })
     assert.equal(legacyHits.matches.length, 1)
@@ -2599,6 +2602,16 @@ test('AI reconnect only refreshes profile credentials while the saved target ide
     assert.equal(reconnected.state, 'open')
     assert.equal(connects, 2)
     assert.equal(registry.sessions.get(info.id).auth.password, 'ROTATED-PASSWORD')
+
+    // Human form override: identity mismatch must reuse the original session
+    // auth, never send the changed profile's new secret to the old endpoint.
+    registry.sessions.get(info.id).state = 'disconnected'
+    registry.sessions.get(info.id).reconnecting = false
+    registry.sessions.get(info.id).connection = undefined
+    saved = { ...saved, host: 'human-changed.example', auth: { type: 'password', password: 'NEW-HUMAN-PASSWORD' } }
+    const human = await registry.reconnect(info.id, {}, 'human', 'owner-a')
+    assert.equal(human.state, 'open')
+    assert.equal(registry.sessions.get(info.id).auth.password, 'ROTATED-PASSWORD', 'the old bound secret is reused, not the new profile secret')
     await registry.dispose()
   })
 })
@@ -2716,6 +2729,108 @@ test('history pagination uses a snapshot and reports a stale offset instead of s
     assert.equal(stale.stale, true)
     assert.deepEqual(stale.sessions, [])
     assert.equal(stale.truncated, true)
+    await registry.dispose()
+  })
+})
+
+test('telnet profile reconnect does not require or read a profile secret', async () => {
+  await withDir(async (dir) => {
+    const secretsMap = new Map()
+    const secrets = {
+      async get(key) { return secretsMap.get(key) },
+      async set(key, value) { secretsMap.set(key, value) },
+      async has(key) { return secretsMap.has(key) },
+      async delete(key) { return secretsMap.delete(key) },
+    }
+    const profiles = new ProfileStore({ dataDir: dir, secrets, log: () => {} })
+    const savedProfile = await profiles.save({ name: 'telnet-p', transport: 'telnet', host: '127.0.0.1', port: 2323, username: '', authType: 'password' })
+    const registry = new SessionRegistry({
+      config: resolveConfig({ ...DEFAULT_CONFIG, aiAccessDefault: 'rw', aiAutoLock: false }),
+      profiles,
+      dataDir: dir,
+      log: () => {},
+      autolog: noopAutolog(),
+    })
+    let connects = 0
+    registry.openConnection = async (session) => {
+      connects += 1
+      session.state = 'open'
+    }
+    const info = await registry.create({ profileId: savedProfile.id }, 'ai', 'owner-telnet')
+    const session = registry.sessions.get(info.id)
+    assert.equal(session.profileBinding.authType, 'none')
+    session.state = 'disconnected'
+    session.connection = undefined
+    const reconnected = await registry.reconnect(info.id, {}, 'ai', 'owner-telnet')
+    assert.equal(reconnected.state, 'open')
+    assert.equal(connects, 2)
+    assert.deepEqual(registry.sessions.get(info.id).auth, { type: 'none' })
+    await registry.dispose()
+  })
+})
+
+test('history tool paging exposes stale after a live close between pages', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    await store.openSession({
+      id: 'st-old', owner: 'owner-a', title: 'old', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-old', 'OLD\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-old', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    const live = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-a')
+    const first = await registry.historyQuery({ owner: 'owner-a', actor: 'human', limit: 1, offset: 0 })
+    assert.equal(first.sessions.length, 1)
+    assert.equal(first.truncated, true)
+    assert.ok(first.snapshot)
+    await registry.close(live.id, 'test close', 'human', 'owner-a')
+    await settle(store)
+    const stale = await registry.historyQuery({
+      owner: 'owner-a', actor: 'human', limit: 1, offset: 1, snapshot: first.snapshot,
+    })
+    assert.equal(stale.stale, true)
+    assert.deepEqual(stale.sessions, [])
+    assert.equal(stale.truncated, true)
+    assert.ok(stale.snapshot && stale.snapshot !== first.snapshot)
+    await registry.dispose()
+  })
+})
+
+test('live output does not invalidate a page snapshot, but close/reorder does', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    await store.openSession({
+      id: 'st-old', owner: 'owner-a', title: 'old', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-old', 'OLD\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-old', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    const live = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-a')
+    const first = await registry.historySessionsPage({ owner: 'owner-a', actor: 'human', limit: 1, offset: 0 })
+    assert.equal(first.sessions[0].live, true)
+    assert.ok(first.snapshot)
+    registry.handleData(registry.sessions.get(live.id), 'MORE-LIVE-OUTPUT\n')
+    const unaffected = await registry.historySessionsPage({
+      owner: 'owner-a', actor: 'human', limit: 1, offset: 1, snapshot: first.snapshot,
+    })
+    assert.equal(unaffected.stale, undefined, 'ordinary live output must not invalidate pagination')
+    assert.equal(unaffected.sessions.length, 1)
+    await registry.close(live.id, 'test close', 'human', 'owner-a')
+    await settle(store)
+    const stale = await registry.historySessionsPage({
+      owner: 'owner-a', actor: 'human', limit: 1, offset: 1, snapshot: first.snapshot,
+    })
+    assert.equal(stale.stale, true, 'closing a live session changes list membership and must stale')
     await registry.dispose()
   })
 })

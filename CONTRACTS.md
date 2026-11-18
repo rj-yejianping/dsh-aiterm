@@ -393,7 +393,7 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-> **v8 安全变更（0.5.8）**：
+> **v8 安全变更（0.5.9）**：
 > 1. 会话 id（`st-N`）不再每次启动从 1 开始。历史目录的 `.ids/st-N` 用 `open(..., 'wx')`
 >    原子预留，跨重启、跨并发宿主续号；分配前还会跳过已有 journal 或已有 `<id>.log` 的 id。
 > 2. 每次 `openSession()` 仍用 `open(..., 'wx')` 独占创建新的 incarnation journal
@@ -575,7 +575,7 @@ export class ScriptStore {
 | `aiterm_screen` | `{ sessionId, changedOnly?, maxLines?, cursor? }` | 可见屏幕文本（去空行、可只回变化行），返回 `cursor`/`atPrompt`/`unchanged` |
 | `aiterm_screenshot` | `{ sessionId }` | **兼容别名**，载荷精简为 `{ text, cols, rows, cursor, atPrompt, session }`（不再重复 `screen`+`text`） |
 | `aiterm_wait` | `{ sessionId, until?, pattern?, idleMs?, timeoutMs?, cursor?, includeOutput? }` | `until`: `idle`(默认)/`pattern`/`exit` |
-| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, offset? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`；`truncated/total` 与 offset 分页；schema 含 `total`）；否则返回匹配/片段 |
+| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, offset?, snapshot? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`；`truncated/total/offset/snapshot` 分页，snapshot 不匹配返回 `stale:true`，服务端来源上限返回 `limitReached`，而非静默跳行）；否则返回匹配/片段 |
 | `aiterm_batch` | `{ steps, targets?, stopOnError?, maxTotalMs?, parallel?, label? }` | §11.2 |
 | `aiterm_script_list` | `{}` | 列出脚本 |
 | `aiterm_script_run` | `{ name, params?, sessionId?, targets? }` | 执行脚本（等价 batch，label=`script:<name>`） |
@@ -598,9 +598,9 @@ export class ScriptStore {
 |---|---|---|
 | `read.delta` | `{ id, cursor?, maxBytes? }` | `{ text, cursor, newBytes, atPrompt }` |
 | `read.screen` | `{ id, changedOnly?, maxLines? }` | `{ text, changedLines, cursor, atPrompt, unchanged }` |
-| `history.sessions` | `{ limit?, offset?, since?, until?, owner? }` | `{ sessions: CatalogEntry[], truncated, total }`（先按 owner 过滤再分页；同一 id 的多个 incarnation 逐条返回，各带 `historyId`） |
-| `history.query` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }`（已关闭会话同样按 owner + 关闭权限判定；`historyId` 精确指定 incarnation） |
-| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files, skipped, omitted? }`（`all` 覆盖本 owner 且当前 actor 可读的**每个** incarnation，最多 5000；超出用 `omitted:{count,limit,reason}` 汇总；skipped 明细最多 100 条+聚合；显式源文件缺失 → `SESSION_NOT_FOUND`） |
+| `history.sessions` | `{ limit?, offset?, snapshot?, since?, until?, owner? }` | `{ sessions: CatalogEntry[], truncated, total, snapshot, stale?, limitReached? }`（先按 owner 过滤再分页；snapshot 不匹配返回 `stale:true`+空 sessions，UI reload；`limitReached` 表示 20k 服务端来源上限） |
+| `history.query` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, offset?, snapshot?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes, total?, snapshot?, stale? }`（已关闭会话同样按 owner + 关闭权限判定；`historyId` 精确指定 incarnation；列表分页返回 total/snapshot/stale） |
+| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files, skipped, skippedTotal, omitted? }`（`all` 覆盖本 owner 且当前 actor 可读的**每个** incarnation，最多 5000；超出用 `omitted:{count,limit,reason}` 汇总；skipped 明细最多 100 条+聚合；显式源文件缺失 → `SESSION_NOT_FOUND`） |
 | `history.legacy.sessions` | `{ limit?, offset?, since?, until? }` | `{ sessions: CatalogEntry[], truncated, total }`（**仅人工**；无归属旧数据可分页恢复） |
 | `history.legacy.query` | `{ sessionId, since?, until?, search?, context?, maxMatches?, maxBytes? }` | history.query 同形（**仅人工**，不改写旧文件） |
 | `history.legacy.export` | `{ sessionId, since?, until? }` | `{ dir, files }`（**仅人工**；旧文件不改不删） |
@@ -650,6 +650,8 @@ scriptsDir: scripts                           # <dataDir> 下脚本目录名
 > 非 undefined**（含 null/空串/false/0/NaN/对象）都会在读取 profile 密钥之前以
 > `AI_PROFILE_TARGET_DENIED` 拒绝；AI 解析只使用 saved 值，不依赖 schema。reconnect 仅在保存 profile 的
 > endpoint/auth 身份与 session 初始绑定完全一致时刷新 secret，否则 `PROFILE_TARGET_CHANGED` 并提示人工重开。
+> Telnet 的有效 auth 身份恒为 none，不读取 profile secret；SSH 才比较 authType。人类遇到 profile 身份改动
+> 时回退到 session 原有 auth（不把新 profile secret 发往旧 endpoint），AI 则严格拒绝。
 > 人工在表单里覆盖地址仍沿用原有行为（保存密码复用于人工编辑的目标）。
 
 ## 13. 配置（profile）管理

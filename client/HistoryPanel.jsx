@@ -92,7 +92,8 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const [listTotal, setListTotal] = useState(0)
   const [listSnapshot, setListSnapshot] = useState('')
   const [listRawCount, setListRawCount] = useState(0)
-  const listEpochRef = useRef(0)
+  const [listLimitReached, setListLimitReached] = useState(false)
+  const loadTokenRef = useRef(0)
   const legacyModeRef = useRef(false)
   const [loadMoreBusy, setLoadMoreBusy] = useState(false)
   const [pickedId, setPickedId] = useState(null)
@@ -128,19 +129,22 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const bodyRef = useRef(null)
   const requestRef = useRef(0)
   const aliveRef = useRef(true)
-  legacyModeRef.current = legacyMode
+  useEffect(() => {
+    legacyModeRef.current = legacyMode
+  }, [legacyMode])
 
   useEffect(() => {
     aliveRef.current = true
     let cancelled = false
+    const token = ++loadTokenRef.current
     const load = async () => {
-      if (!cancelled) {
+      if (!cancelled && token === loadTokenRef.current) {
         setListState('loading')
         setListError(null)
       }
       try {
         const raw = await historySessions({ limit: 50 })
-        if (cancelled || !aliveRef.current) return
+        if (cancelled || !aliveRef.current || token !== loadTokenRef.current) return
         const list = raw && Array.isArray(raw.sessions)
           ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
           : []
@@ -152,12 +156,12 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         setListTotal(typeof raw?.total === 'number' ? raw.total : list.length)
         setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : '')
         setListRawCount(list.length)
-        listEpochRef.current += 1
+        setListLimitReached(raw?.limitReached === true)
         const preferred = list.find((entry) => entry.id === sessionId) || list[0]
         setPickedId(preferred ? preferred.id : null)
         setPickedHistoryId(preferred ? (preferred.historyId || null) : null)
       } catch (error) {
-        if (cancelled || !aliveRef.current) return
+        if (cancelled || !aliveRef.current || token !== loadTokenRef.current) return
         setListError(errorMessage(error))
         setListState('error')
       }
@@ -166,6 +170,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
     return () => {
       cancelled = true
       aliveRef.current = false
+      loadTokenRef.current += 1
     }
   }, [])
 
@@ -395,10 +400,12 @@ export function HistoryPanel({ t, sessionId, onClose }) {
 
   /** Load the normal owner-scoped list (also used when leaving legacy mode). */
   const loadNormal = async () => {
+    const token = ++loadTokenRef.current
     setListState('loading')
     setListError(null)
     try {
       const raw = await historySessions({ limit: 50 })
+      if (!aliveRef.current || token !== loadTokenRef.current) return
       const list = raw && Array.isArray(raw.sessions)
         ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
         : []
@@ -409,7 +416,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListTotal(typeof raw?.total === 'number' ? raw.total : list.length)
       setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : '')
       setListRawCount(list.length)
-      listEpochRef.current += 1
+      setListLimitReached(raw?.limitReached === true)
       const preferred = list.find((entry) => entry.id === sessionId) || list[0]
       setPickedId(preferred ? preferred.id : null)
       setPickedHistoryId(preferred ? (preferred.historyId || null) : null)
@@ -418,6 +425,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setQueryError(null)
       setManualText(null)
     } catch (error) {
+      if (!aliveRef.current || token !== loadTokenRef.current) return
       setListError(errorMessage(error))
       setListState('error')
     }
@@ -426,6 +434,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   /** Open the explicit human-only legacy view. */
   const enterLegacy = async () => {
     if (legacyBusy) return
+    const token = ++loadTokenRef.current
     setLegacyBusy(true)
     requestRef.current += 1
     setLegacyMode(true)
@@ -442,6 +451,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
     setExportError(null)
     try {
       const raw = await legacyHistorySessions({ limit: 50 })
+      if (!aliveRef.current || token !== loadTokenRef.current) return
       const list = raw && Array.isArray(raw.sessions)
         ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
         : []
@@ -452,10 +462,11 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListTotal(typeof raw?.total === 'number' ? raw.total : list.length)
       setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : '')
       setListRawCount(list.length)
-      listEpochRef.current += 1
+      setListLimitReached(raw?.limitReached === true)
       setPickedId(list[0] ? list[0].id : null)
       setPickedHistoryId(null)
     } catch (error) {
+      if (!aliveRef.current || token !== loadTokenRef.current) return
       setListError(errorMessage(error))
       setListState('error')
     } finally {
@@ -466,6 +477,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   /** Leave legacy mode and restore the normal owner-scoped list. */
   const leaveLegacy = async () => {
     if (legacyBusy) return
+    loadTokenRef.current += 1
     setLegacyBusy(true)
     requestRef.current += 1
     setLegacyMode(false)
@@ -482,9 +494,9 @@ export function HistoryPanel({ t, sessionId, onClose }) {
 
   /** Fetch the next page for the current source, with snapshot/epoch guards. */
   const loadMore = async () => {
-    if (loadMoreBusy) return
+    if (loadMoreBusy || listLimitReached) return
+    const token = ++loadTokenRef.current
     const modeAtStart = legacyMode
-    const epochAtStart = listEpochRef.current
     const snapshotAtStart = listSnapshot
     const offsetAtStart = listRawCount
     setLoadMoreBusy(true)
@@ -492,7 +504,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       const raw = modeAtStart
         ? await legacyHistorySessions({ limit: 50, offset: offsetAtStart, snapshot: snapshotAtStart })
         : await historySessions({ limit: 50, offset: offsetAtStart, snapshot: snapshotAtStart })
-      if (!aliveRef.current || epochAtStart !== listEpochRef.current || modeAtStart !== legacyModeRef.current) return
+      if (!aliveRef.current || token !== loadTokenRef.current || modeAtStart !== legacyModeRef.current) return
       if (raw?.stale === true) {
         // The server's ordering/activity changed while paging. A stale offset
         // could skip rows; reload from the first page instead of silently
@@ -517,6 +529,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListTotal(typeof raw?.total === 'number' ? raw.total : listTotal)
       setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : snapshotAtStart)
       setListRawCount(offsetAtStart + more.length)
+      setListLimitReached(raw?.limitReached === true)
     } catch (error) {
       notify(fmt(t, 'historySessionsFailed', { message: errorMessage(error) }))
     } finally {
@@ -591,11 +604,15 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       {listTruncated ? (
         <div style={S.actionRow}>
           <span style={S.hint} role="status">
-            {fmt(t, 'historySessionsTruncated', { shown: sessions.length, total: listTotal })}
+            {listLimitReached
+              ? fmt(t, 'historySessionsLimitReached', { shown: sessions.length, total: listTotal })
+              : fmt(t, 'historySessionsTruncated', { shown: sessions.length, total: listTotal })}
           </span>
-          <Btn onClick={loadMore} busy={loadMoreBusy} disabled={loadMoreBusy}>
-            {t('historyLoadMore')}
-          </Btn>
+          {listLimitReached ? null : (
+            <Btn onClick={loadMore} busy={loadMoreBusy} disabled={loadMoreBusy}>
+              {t('historyLoadMore')}
+            </Btn>
+          )}
         </div>
       ) : null}
       {sessions.length > 0 ? (

@@ -2445,7 +2445,12 @@ await closePanelViaBar()
   }
 
   // ── history panel: export (current / all) + auto-log switch ────────────
+  let raceResolve = null
+  let raceActive = false
   scene.handlers.set('history.sessions', async (params) => {
+    if (raceActive && params.offset === 1) {
+      return await new Promise((resolve) => { raceResolve = resolve })
+    }
     if (params.offset === 1 && params.snapshot === 'snap-1') {
       return { sessions: [], total: 2, truncated: true, stale: true, snapshot: 'snap-2' }
     }
@@ -2529,6 +2534,32 @@ await closePanelViaBar()
     assert.ok(calls.some((entry) => entry.params.offset === 1 && entry.params.snapshot === 'snap-1'), 'load more must send the snapshot and raw offset')
     assert.ok(calls.some((entry) => (entry.params.offset === undefined || entry.params.offset === 0)), 'a stale response must reload the first page')
     assert.ok(textOf(lastTree).includes(dict('historyStaleReload').slice(0, 8)), 'the stale reload must be explained')
+  }
+
+  // A normal loadMore that resolves after switching to legacy must not paint
+  // into the legacy page (real bundle async race).
+  {
+    raceActive = true
+    await clickNode(findButtonByText(dict('historyLoadMore')), 'start racing normal page')
+    await settle('normal page pending')
+    await clickNode(findButtonByText(dict('historyLegacyEntry')), 'switch to legacy while normal page pending')
+    await settle('legacy page loaded')
+    assert.ok(textOf(lastTree).includes('old-unowned'), 'legacy list must render while the normal page is pending')
+    assert.equal(typeof raceResolve, 'function')
+    raceResolve({
+      sessions: [
+        { id: 'st-ssh-race', title: 'normal-race', transport: 'ssh', host: '10.0.0.5', port: 22, username: 'root', createdAt: now - 30_000, bytes: 10, lastTs: now },
+      ],
+      total: 2,
+      truncated: false,
+      snapshot: 'snap-race',
+    })
+    await settle('late normal page resolved')
+    assert.equal(textOf(lastTree).includes('normal-race'), false, 'a stale normal response must not paint the legacy page')
+    assert.ok(textOf(lastTree).includes('old-unowned'), 'the legacy page must remain authoritative')
+    raceActive = false
+    await clickNode(findButtonByText(dict('historyLegacyBack')), 'return from race legacy')
+    await settle('returned to normal history')
   }
 
   // Explicit human-only legacy view: owner-bound GUI still reaches it.
