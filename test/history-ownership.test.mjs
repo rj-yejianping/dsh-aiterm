@@ -1251,26 +1251,117 @@ test('unknown history ids do not trigger one directory scan per request', async 
   })
 })
 
-test('export refuses an oversized journal instead of materializing it', async () => {
+test('export streams a large journal instead of enforcing an arbitrary size ceiling', async () => {
   await withDir(async (dir) => {
-    const journal = join(dir, 'huge.ndjson')
-    await writeFile(journal, `${JSON.stringify({ t: T0, d: payload('X'.repeat(200)) })}\n`, { mode: 0o600 })
+    const journal = join(dir, 'large.ndjson')
+    const lines = []
+    for (let index = 0; index < 4000; index += 1) {
+      lines.push(JSON.stringify({ t: T0 + index, d: payload(`${String(index).padStart(5, '0')} ${'X'.repeat(200)}\n`) }))
+    }
+    await writeFile(journal, `${lines.join('\n')}\n`, { mode: 0o600 })
     const out = join(dir, 'exports')
     const fakeStore = {
       fileFor: () => journal,
       flush: async () => {},
       listSessions: async () => [{
-        id: 'st-1', title: 'huge', transport: 'ssh', host: 'h.example', port: 22, username: 'u', createdAt: T0, bytes: 200, lastTs: T0,
+        id: 'st-1', title: 'large', transport: 'ssh', host: 'h.example', port: 22, username: 'u', createdAt: T0, bytes: 1, lastTs: T0,
       }],
     }
-    await assert.rejects(
-      () => exportSessions({ historyStore: fakeStore, dir: out, sessionId: 'st-1', maxJournalBytes: 10 }),
-      (error) => {
-        assert.equal(error?.code, 'HISTORY_TOO_LARGE')
-        return true
-      },
-    )
-    assert.deepEqual(await readdir(out), [], 'no partial/empty export may be written')
+    const result = await exportSessions({ historyStore: fakeStore, dir: out, sessionId: 'st-1' })
+    assert.equal(result.files.length, 1)
+    assert.deepEqual(result.skipped, [])
+    assert.ok(result.files[0].bytes > 64 * 1024, 'the streamed export is not empty')
+    assert.equal(result.files[0].lines, 4002, 'all records plus the two header lines')
+    const text = await readFile(result.files[0].path, 'utf8')
+    assert.ok(text.includes('03999 '), 'the final record was streamed')
+  })
+})
+
+test('export all covers every readable incarnation, skips unreadable ones, and reports missing sources', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const openSame = async (title, createdAt) => {
+      await store.openSession({
+        id: 'st-1', owner: 'owner-same', title, transport: 'ssh', host: 'same.example', port: 22, username: 'u', createdAt,
+      })
+    }
+    await openSame('first', T0)
+    store.appendChunk('st-1', 'FIRST-ALL\n', T0 + 1, 'owner-same')
+    await store.closeSession('st-1', { owner: 'owner-same', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await openSame('second', T0 + 3)
+    store.appendChunk('st-1', 'SECOND-ALL\n', T0 + 4, 'owner-same')
+    await store.closeSession('st-1', { owner: 'owner-same', closedAt: T0 + 5, permission: { aiAccess: 'rw' } })
+    await openSame('wo', T0 + 6)
+    store.appendChunk('st-1', 'WO-ALL\n', T0 + 7, 'owner-same')
+    await store.closeSession('st-1', { owner: 'owner-same', closedAt: T0 + 8, permission: { aiAccess: 'wo' } })
+    await openSame('crash', T0 + 9)
+    store.appendChunk('st-1', 'UNKNOWN-ALL\n', T0 + 10, 'owner-same')
+    await store.flush('st-1')
+    await settle(store)
+
+    const fresh = makeStore(dir)
+    await fresh.init()
+    const registry = makeRegistry(dir, fresh)
+
+    const ai = await registry.exportHistory({ all: true, owner: 'owner-same', actor: 'ai' })
+    assert.equal(ai.files.length, 2, 'both rw incarnations are exported')
+    assert.equal(ai.skipped.length, 2, 'wo and unknown-permission incarnations are reported individually')
+    assert.deepEqual(new Set(ai.skipped.map((entry) => entry.code)), new Set(['AI_READ_DENIED']))
+    const aiText = (await Promise.all(ai.files.map((file) => readFile(file.path, 'utf8')))).join('\n')
+    assert.equal(aiText.includes('FIRST-ALL'), true)
+    assert.equal(aiText.includes('SECOND-ALL'), true)
+    assert.equal(aiText.includes('WO-ALL'), false)
+    assert.equal(aiText.includes('UNKNOWN-ALL'), false)
+    assert.equal(new Set(ai.files.map((file) => file.path)).size, ai.files.length)
+
+    const human = await registry.exportHistory({ all: true, owner: 'owner-same', actor: 'human' })
+    assert.equal(human.files.length, 4, 'the human can export all recorded incarnations')
+    const humanText = (await Promise.all(human.files.map((file) => readFile(file.path, 'utf8')))).join('\n')
+    assert.equal(humanText.includes('WO-ALL'), true)
+    assert.equal(humanText.includes('UNKNOWN-ALL'), true)
+    assert.equal(human.skipped.length, 0)
+
+    // A vanished source is reported as skipped, never as a successful file.
+    const missing = ai.files[0]
+    await rm(missing.path, { force: true })
+    const withMissing = await registry.exportHistory({ all: true, owner: 'owner-same', actor: 'ai' })
+    assert.ok(withMissing.files.length >= 1, 'readable sources are still exported')
+    assert.equal(withMissing.skipped.length, 2, 'only the permission skips remain after an export file is deleted')
+
+    const source = fresh.journalForSync('st-1', { owner: 'owner-same', actor: 'ai', historyId: ai.files[0].historyId })
+    assert.ok(source)
+    await rm(source, { force: true })
+    const skipped = await registry.exportHistory({ all: true, owner: 'owner-same', actor: 'ai' })
+    assert.equal(skipped.skipped.length, 3, 'two permission skips plus the missing source')
+    const missingSkip = skipped.skipped.find((entry) => entry.code === 'SESSION_NOT_FOUND')
+    assert.ok(missingSkip)
+    assert.equal(missingSkip.sessionId, 'st-1')
+    assert.equal(skipped.skipped.filter((entry) => entry.code === 'AI_READ_DENIED').length, 2)
+    assert.equal(skipped.files.length, 1, 'the remaining readable incarnation is exported')
+    await registry.dispose()
+  })
+})
+
+test('concurrent all-exports never choose the same file name', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'same', transport: 'ssh', host: 'a.example', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'CONCURRENT\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const registry = makeRegistry(dir, store)
+    const [left, right] = await Promise.all([
+      registry.exportHistory({ all: true, owner: 'owner-a', actor: 'ai' }),
+      registry.exportHistory({ all: true, owner: 'owner-a', actor: 'ai' }),
+    ])
+    const leftPaths = new Set(left.files.map((file) => file.path))
+    const rightPaths = new Set(right.files.map((file) => file.path))
+    for (const path of leftPaths) assert.equal(rightPaths.has(path), false)
+    await registry.dispose()
   })
 })
 
@@ -1361,6 +1452,33 @@ test('the legacy view opens the legacy file even when a new incarnation shares i
     const text = await readFile(exported.files[0].path, 'utf8')
     assert.equal(text.includes('LEGACY-ONLY'), true)
     assert.equal(text.includes('ATTRIBUTED-ONLY'), false)
+    await registry.dispose()
+  })
+})
+
+test('export all does not report a readable live incarnation as a permission skip', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-live', title: 'closed', transport: 'ssh', host: 'closed.example', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'CLOSED-LIVE\n', T0 + 1, 'owner-live')
+    await store.closeSession('st-1', { owner: 'owner-live', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await settle(store)
+
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const live = await registry.create({ transport: 'telnet', host: '10.0.0.6', port: 23 }, 'ai', 'owner-live')
+    registry.handleData(registry.sessions.get(live.id), 'LIVE-DATA\n')
+    const exported = await registry.exportHistory({ all: true, owner: 'owner-live', actor: 'ai' })
+    assert.equal(exported.skipped.length, 0, 'a readable live incarnation is not a permission skip')
+    assert.equal(exported.files.length, 2)
+    const text = (await Promise.all(exported.files.map((file) => readFile(file.path, 'utf8')))).join('\n')
+    assert.equal(text.includes('CLOSED-LIVE'), true)
+    assert.equal(text.includes('LIVE-DATA'), true)
     await registry.dispose()
   })
 })

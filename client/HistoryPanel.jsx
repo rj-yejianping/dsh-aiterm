@@ -304,7 +304,12 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         : await historyExport(params)
       setExported(result || null)
       const files = result && Array.isArray(result.files) ? result.files : []
-      notify(files.length > 0 ? fmt(t, 'historyExportDone', { count: files.length }) : t('historyExportEmpty'))
+      const skipped = result && Array.isArray(result.skipped) ? result.skipped : []
+      notify(
+        files.length > 0
+          ? fmt(t, 'historyExportDone', { count: files.length })
+          : (skipped.length > 0 ? fmt(t, 'historyExportSkippedTitle', { count: skipped.length }) : t('historyExportEmpty')),
+      )
     } catch (error) {
       if (error && error.code === 'UNKNOWN_METHOD') {
         setLogBackend(false)
@@ -653,6 +658,14 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       {exported ? (
         <div style={S.exportBox} role="status">
           <div style={S.hint}>{fmt(t, 'historyExportWhere', { dir: exported.dir || '' })}</div>
+          {(exported.skipped || []).length > 0 ? (
+            <div style={S.hint}>
+              {fmt(t, 'historyExportSkipped', {
+                count: exported.skipped.length,
+                sessions: exported.skipped.map((entry) => entry.sessionId).join(', '),
+              })}
+            </div>
+          ) : null}
           {(exported.files || []).map((file) => (
             <div key={file.path} style={S.exportRow}>
               <span style={S.exportPath} title={file.path}>{file.path}</span>

@@ -39,7 +39,7 @@ dsh plugin --profile web add dsh-aiterm
 
 ```bash
 npm install && npm run build   # 需要 esbuild / xterm 才能重建 lib/client.js
-npm pack                       # → dsh-aiterm-0.5.4.tgz
+npm pack                       # → dsh-aiterm-0.5.5.tgz
 # 然后 plugin_manager(action:"install_bundle", target:"<tgz 绝对路径>")
 ```
 
@@ -68,7 +68,7 @@ sed -i 's#^  ssh-telnet/#  aiterm/#' ~/.dsh/.credentials.yaml
 sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 ```
 
-然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.4`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
+然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.5`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
 
 升级后需要自己改的地方：
 
@@ -359,7 +359,7 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
 - 哪些是宿主级、不按会话隔离：连接配置（`profiles`）、保存的脚本（`scripts`）、自动写日志开关。
   自动写日志开关会写到*所有*会话，因此只允许人工在面板修改，AI 的 `aiterm_autolog` 只能查询
 - **[旧历史（无归属）]** 是明确的人工入口：不向 AI 暴露，不自动给旧文件补 owner，查看/导出都不改写、不删除旧文件
-- `导出全部` **不是**跨对话操作：它只导出本对话拥有的终端（含已关闭的、且 AI 可读的）；重复 id 的旧 incarnation 用 `historyId` 单独导出
+- `导出全部` **不是**跨对话操作：它只导出本对话拥有、且当前 actor 可读的**每一个 incarnation**（同一 id 的旧 incarnation 也会各自生成文件；wo/未知权限按 AI 权限跳过）
 
 > 切换 DSH 会话时面板会清空并重新拉取，这是设计行为——不会把上一个对话的终端带过来。
 > **历史的安全边界**：每次打开会话都会用 `wx` 独占创建 `<sessionId>~<uuid>.ndjson`，因此两个
@@ -382,9 +382,10 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
 | 按钮 | 作用 |
 |---|---|
 | 导出当前 | 把当前选中会话的输出写成一个文本文件 |
-| 导出全部 | 本对话拥有的每个终端各写一个文件（含已关闭的；AI 只写会话不导出） |
+| 导出全部 | 本对话拥有、当前可读的每个 incarnation 各写一个文件（含已关闭的；AI 只写/未知权限的 incarnation 跳过） |
 
-- 输出目录：`~/.dsh/aiterm/exports/`，文件名 `<会话id>-<incarnation短码>-<标题>-<时间戳>.log`（旧版/无 historyId 的文件不带短码；同一 id 的多个 incarnation 不会互相覆盖）
+- 输出目录：`~/.dsh/aiterm/exports/`，文件名 `<会话id>-<incarnation短码>-<标题>-<时间戳>-<随机短码>.log`（旧版/无 historyId 的文件不带 incarnation 短码；随机短码保证并发导出也不会互相覆盖）
+- 导出结果同时返回 `skipped`：源文件缺失/不可读的条目会明确列出（`code`/`message`），不会伪装成成功的空文件；显式导出单个会话时缺失源直接报错。
 - 内容：头注释（协议 / `user@host:port` / 标题 / 开始时间）+ 每行 `<ISO 时间戳> <输出行>`
 - 文件写在**宿主机**上（不是浏览器下载），用 DSH 的文件面板取走即可；导出结果面板会列出路径、大小、行数
 - 导出失败会显示原因；若提示「重启 DSH 后可用」，说明宿主代码还是旧代际
@@ -403,12 +404,12 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
   人工在面板选择「继续启用」或「保持关闭」后才会写入确认标记。若人工不操作，重启后仍保持关闭。
   这是有意的兼容性变化：升级后既有自动日志不会立即继续，需人工确认一次。
 
-### 0.5.4 升级/回滚与历史兼容
+### 0.5.5 升级/回滚与历史兼容
 
 - **升级**：不需要迁移命令，也不改写/删除现有历史或 `settings.json`。第一次启动会扫描历史头并在 `history/.ids/` 建 id reservation；旧文件保持原样。
 - **会话 id**：从 0.5.4 起跨重启续号，不再回到 `st-1`；如果历史目录被清空，续号信息也一起丢失。
 - **重复 id**：列表会显示全部 incarnation（各带 `historyId`）；旧客户端只按 `sessionId` 取最新一条（兼容），新客户端/工具用 `historyId` 精确访问。
-- **回滚**：0.5.3 能读新日志头但仍只挑最新 incarnation；0.5.2 及更早看不到新文件名格式。回滚不会删除旧文件，但旧 incarnation 可能重新变得不可见；需要完整访问时请保留 0.5.4。自动日志若在 0.5.4 已人工确认过，`settings.json` 带 `reviewedAt`；回滚到旧版会按其旧逻辑读取 `enabled`。
+- **回滚**：0.5.3 能读新日志头但仍只挑最新 incarnation；0.5.2 及更早看不到新文件名格式。回滚不会删除旧文件，但旧 incarnation 可能重新变得不可见；需要完整访问时请保留 0.5.4+。自动日志若在 0.5.4+ 已人工确认过，`settings.json` 带 `reviewedAt`；回滚到旧版会按其旧逻辑读取 `enabled`。
 - **旧历史入口**：`[旧历史（无归属）]` 只在面板提供，AI 工具没有对应参数；旧文件永远不自动补 owner。
 
 ## 脚本

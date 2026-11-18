@@ -393,7 +393,7 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-> **v8 安全变更（0.5.4）**：
+> **v8 安全变更（0.5.5）**：
 > 1. 会话 id（`st-N`）不再每次启动从 1 开始。历史目录的 `.ids/st-N` 用 `open(..., 'wx')`
 >    原子预留，跨重启、跨并发宿主续号；分配前还会跳过已有 journal 或已有 `<id>.log` 的 id。
 > 2. 每次 `openSession()` 仍用 `open(..., 'wx')` 独占创建新的 incarnation journal
@@ -462,8 +462,10 @@ export class HistoryStore {
 - 任意 journal 缺文件头/关闭权限缺失 → AI fail closed。legacy 只允许显式 `actor:'human'` 的 `history.legacy.*`
   读取，且必须能在 `index.json` 中存在（孤儿文件不暴露）；旧文件不改不删。
 - 未知 id 的查询最多每 `SCAN_COOLDOWN_MS`（1s）扫一次目录，避免被反复猜测 id 放大 I/O。
-- 搜索对 live 与 closed 一致地不区分大小写；导出对单文件有 64 MiB 上限（`HISTORY_TOO_LARGE`），
-  显式导出源文件消失返回 `SESSION_NOT_FOUND`，不再写空文件。
+- 搜索对 live 与 closed 一致地不区分大小写。导出按 64 KiB 块**流式**读取/写入，不设固定
+  单文件上限（覆盖配置允许的 512 MiB），显式导出源文件消失返回 `SESSION_NOT_FOUND`；
+  `all` 中缺失/不可读的源写入 `skipped[{sessionId,historyId,code,message}]`，绝不写空文件冒充成功。
+  同一逻辑 id 的每个可读 incarnation 都单独导出，文件名含 incarnation 短码与随机短码，并发不冲突。
 - 多个 `HistoryStore` 并发/重载/旧实例延迟 flush 时，`wx` id/journal 预留与独立文件名保证不串写；
   `index.json` 的 last-writer-wins 不影响归属判定。
 - 审计：live 会话的 history slice/export 会写入该会话的审计环；已关闭会话没有进程内审计归属，
@@ -571,7 +573,7 @@ export class ScriptStore {
 | `read.screen` | `{ id, changedOnly?, maxLines? }` | `{ text, changedLines, cursor, atPrompt, unchanged }` |
 | `history.sessions` | `{ limit?, since?, until?, owner? }` | `{ sessions: CatalogEntry[] }`（按 owner 过滤；同一 id 的多个 incarnation 逐条返回，各带 `historyId`） |
 | `history.query` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }`（已关闭会话同样按 owner + 关闭权限判定；`historyId` 精确指定 incarnation） |
-| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files: [{ sessionId, path, bytes, lines }] }`（`all` 只覆盖本 owner 且 AI 可读的会话；显式源文件缺失 → `SESSION_NOT_FOUND`） |
+| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files: [{ sessionId, historyId?, path, bytes, lines }], skipped: [{ sessionId, historyId?, code, message }] }`（`all` 覆盖本 owner 且当前 actor 可读的**每个** incarnation；显式源文件缺失 → `SESSION_NOT_FOUND`） |
 | `history.legacy.sessions` | `{ limit?, since?, until? }` | `{ sessions: CatalogEntry[] }`（**仅人工**；无归属旧数据） |
 | `history.legacy.query` | `{ sessionId, since?, until?, search?, context?, maxMatches?, maxBytes? }` | history.query 同形（**仅人工**，不改写旧文件） |
 | `history.legacy.export` | `{ sessionId, since?, until? }` | `{ dir, files }`（**仅人工**；旧文件不改不删） |
