@@ -568,3 +568,104 @@ test(
     afterDisposal.dispose()
   },
 )
+
+/**
+ * Mount the plugin's progressive-mode tools on a fresh real DSH ToolsService.
+ *
+ * Two allow-list scenarios below are characterization tests for production
+ * behavior that this change deliberately does not alter: an existing scope
+ * restriction is authoritative, including when its allow-list predates
+ * `aiterm_discover`. They never install, reload or mutate the live profile.
+ * @returns {any} a fresh real Context with the real tools service mounted.
+ */
+function makeRealProgressiveRoot() {
+  const { Context, ToolsService } = realRuntime
+  const root = new Context()
+  root.provide('systemPrompt')
+  root.set('systemPrompt', { tools() {} })
+  new ToolsService(root)
+  registerTools(root, {
+    config: { toolDisclosure: 'progressive' },
+    logger: root.logger ?? { info() {}, warn() {}, error() {} },
+  })
+  return root
+}
+
+test(
+  'characterization: an allow-list holding the 21 existing tools but not aiterm_discover leaves progressive mode with zero tools',
+  { skip: realRuntime === null ? 'real @deepseek-ai/dsh-tools is not resolvable from this checkout' : false },
+  async () => {
+    const { createScope } = realRuntime
+    const root = makeRealProgressiveRoot()
+    const agent = { id: 'agent-allowlist-legacy' }
+    const scope = createScope(root, agent)
+    try {
+      // The deployment's pre-existing allow-list: exactly the tool names that
+      // existed before progressive disclosure. `aiterm_discover` is a new name,
+      // so it is absent from the list.
+      scope.ctx.tools.restrict({ allow: ORIGINAL_TOOLS })
+      assert.equal(ORIGINAL_TOOLS.includes(DISCOVER), false)
+
+      const step = await root.tools.resolve({ agent, modelSelection, signal: new AbortController().signal })
+      // The restriction removes the only always-resident entry...
+      assert.equal(root.tools.get(DISCOVER, agent), undefined)
+      // ...and every original tool still fails its unexpanded step condition,
+      // so this Agent's snapshot is empty. Progressive mode cannot fall back to
+      // full mode from inside the restricted Agent: adding the new name to the
+      // allow-list is the only migration that does not weaken the restriction.
+      const names = [...step.view(agent).keys()]
+      assert.deepEqual(names, [])
+      assert.equal(step.view(agent).size, 0)
+    } finally {
+      await scope.dispose()
+    }
+  },
+)
+
+test(
+  'characterization: adding aiterm_discover to an allow-list restores progressive mode without widening it',
+  { skip: realRuntime === null ? 'real @deepseek-ai/dsh-tools is not resolvable from this checkout' : false },
+  async () => {
+    const { createScope } = realRuntime
+    const root = makeRealProgressiveRoot()
+    const agent = { id: 'agent-allowlist-with-discover' }
+    const scope = createScope(root, agent)
+    try {
+      // Same allow-list plus the new resident entry; one session tool and the
+      // whole automation group stay outside the list so the test can prove the
+      // restriction still wins.
+      const blocked = new Set(['aiterm_send', ...DISCLOSURE_GROUPS.automation])
+      const allowed = [DISCOVER, ...ORIGINAL_TOOLS.filter((name) => !blocked.has(name))]
+      scope.ctx.tools.restrict({ allow: allowed })
+      const resolve = () => root.tools.resolve({ agent, modelSelection, signal: new AbortController().signal })
+
+      const first = await resolve()
+      assert.deepEqual([...first.view(agent).keys()], [DISCOVER])
+      const discover = first.view(agent).get(DISCOVER)
+
+      // Expansion reports only names that this Agent's restriction leaves
+      // visible, so the hidden tool never leaks through the catalogue.
+      const opened = await discover.execute({ group: 'session' }, { agent })
+      assert.equal(opened.ok, true)
+      assert.equal(opened.visible.includes('aiterm_send'), false)
+      // A group with no allowed member cannot be expanded.
+      const automation = await discover.execute({ group: 'automation' }, { agent })
+      assert.equal(automation.ok, false)
+      assert.equal(automation.error, 'no-visible-tools')
+
+      const second = await resolve()
+      assert.deepEqual(
+        [...second.view(agent).keys()].sort(),
+        [DISCOVER, ...DISCLOSURE_GROUPS.session.filter((name) => name !== 'aiterm_send')].sort(),
+      )
+      // Including the discovery entry never widens the allow-list: the missing
+      // tools are still absent after a group expansion.
+      assert.equal(root.tools.get('aiterm_send', agent), undefined)
+      assert.equal(root.tools.get('aiterm_batch', agent), undefined)
+      assert.equal(second.view(agent).has('aiterm_send'), false)
+      assert.equal(second.view(agent).has('aiterm_batch'), false)
+    } finally {
+      await scope.dispose()
+    }
+  },
+)

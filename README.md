@@ -39,7 +39,7 @@ dsh plugin --profile web add dsh-aiterm
 
 ```bash
 npm install && npm run build   # 需要 esbuild / xterm 才能重建 lib/client.js
-npm pack                       # → dsh-aiterm-0.5.0.tgz
+npm pack                       # → dsh-aiterm-0.5.2.tgz
 # 然后 plugin_manager(action:"install_bundle", target:"<tgz 绝对路径>")
 ```
 
@@ -68,7 +68,7 @@ sed -i 's#^  ssh-telnet/#  aiterm/#' ~/.dsh/.credentials.yaml
 sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 ```
 
-然后卸载旧包、安装 `dsh-aiterm@0.5.0` 并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
+然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.2`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
 
 升级后需要自己改的地方：
 
@@ -137,30 +137,51 @@ owner 绑定和权限判定都不变；唯一的注册差异是它们会额外�
 
 ## 配置
 
-在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 覆盖本插件行（只需写要覆盖的键，未给出的取默认值）：
+在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 覆盖本插件行。**DSH 的补丁层不是深合并**：
+按 `id` 匹配的补丁会**整体替换该行的 `config` 对象**，不是只覆盖你写出的键。未写出的键由插件
+默认值补齐，所以"只写要改的键"会让其余键悄悄回到默认值——例如 `aiAccessDefault` 默认是
+`rw`，此前设为 `ro` 的部署会因为漏写而**放宽 AI 权限**。
+
+因此升级或改配置时请**保留完整对象**并显式写出安全值。下面的示例是全量配置（值均为默认值，
+只把 `aiAccessDefault` 显式固定为 `ro`）；请按需修改，不要删掉你依赖的键：
 
 ```yaml
 - id: aiterm
   name: 'dsh-aiterm'
   config:
-    toolDisclosure: full       # full（默认，21 个工具全量注册）| progressive（先发现、按组展开）
-    aiAccessDefault: ro        # 新会话默认 AI 权限：ro | wo | rw
-    aiAutoLock: true           # AI 写入时是否自动取得控制权
-    aiLockIdleMs: 30000        # AI 控制权空闲自动释放时间
-    blockHumanWhileAi: true    # 核心行为：AI 操作时屏蔽人工写
-    humanCanPreempt: true      # 是否允许人工随时接管
+    enabled: true
+    toolDisclosure: full            # full（默认，21 个工具全量注册）| progressive（先发现、按组展开）
+    aiAccessDefault: ro             # 新会话默认 AI 权限：ro | wo | rw；显式写出，避免漏写回落到 rw
+    aiAutoLock: true                # AI 写入时是否自动取得控制权
+    aiLockIdleMs: 30000             # AI 控制权空闲自动释放时间
+    blockHumanWhileAi: true         # 核心行为：AI 操作时屏蔽人工写
+    humanCanPreempt: true           # 是否允许人工随时接管
     maxSessions: 16
     scrollback: 4000
-    replayBufferBytes: 262144  # 重连回放保留的原始输出字节数
+    replayBufferBytes: 262144       # 重连回放保留的原始输出字节数
     aiReadMaxBytes: 65536
+    deltaDefaultMaxBytes: 8192
     connectTimeoutMs: 20000
     keepaliveMs: 15000
     routePath: /aiterm
-    knownHostsPolicy: accept-new   # accept-new | strict | insecure
+    knownHostsPolicy: accept-new    # accept-new | strict | insecure
     terminalType: xterm-256color
+    promptPattern: '[#$%>❯»]\s*$'
     # v2 读取 / 历史 / 脚本
-    promptPattern: '(?:^|[\s\])])[#$%>❯»]\s*'
+    historyRetentionMs: 86400000    # 24 小时
+    historyMaxBytesPerSession: 8388608
+    historyMaxSessions: 100
+    historyFlushIntervalMs: 250
+    scriptsDir: scripts
+    maxDetachedSessions: 20
+    autoReconnect: false
+    autoReconnectAttempts: 3
+    autoReconnectDelayMs: 2000
 ```
+
+> 如果你原来就用默认的 `aiAccessDefault: rw`，显式写 `rw` 与不写等价；如果你曾设为 `ro` 或
+> `wo`，务必保留该值，否则会被默认的 `rw` 替换。这是 DSH 补丁的替换语义，不是本插件做的
+> 深合并；`aiAccessDefault` 只会影响**新会话**，不会改动已存在会话的权限。
 
 `toolDisclosure` 只在插件加载时读取（见下方「工具渐进披露」）；切换取值会重载插件行，
 **可能关闭当前终端**。其余配置项与默认值、取值范围见 `CONTRACTS.md`。
@@ -193,6 +214,26 @@ owner 绑定和权限判定都不变；唯一的注册差异是它们会额外�
 4. 先展开 `session` 并 `aiterm_list` 拿到会话 id，history / automation / management
    里的操作才有目标可用。
 
+### 升级注意：工具 allow-list 必须显式加入 `aiterm_discover`
+
+如果部署、Agent preset 或子代理的 `toolFilter` 用 `tools.restrict({ allow: [...] })` 把本插件
+的工具限制为一份**白名单**，这份名单通常只包含改动前的 21 个 `aiterm_*` 名字。`progressive`
+的常驻发现入口 `aiterm_discover` 是**新名字**：白名单不包含它时，它会在步骤解析阶段被过滤
+掉；同时 21 个业务工具又都还没有展开，于是**该 Agent 这一步一个 aiterm 工具都拿不到**。
+这是既有安全限制按预期生效，不是可自动恢复的降级，也不能由模型自行绕过。
+
+迁移方式（**不改变任何限制**）：
+
+1. **想用 `progressive`**：在原有白名单里**追加 `aiterm_discover`**，其余 21 个名字保持原样；
+   `deny` 仍然优先，白名单外的工具在展开后也不可见。
+2. **不想改白名单**：保持 `toolDisclosure: full`；`full` 不注册新名字，白名单行为与升级前
+   完全一致。
+3. **不要把"放开限制 / 删除 deny / 清空白名单"当作迁移手段**；需要精确白名单时选 `full`。
+
+已用真实 DSH `ToolsService` 固定这两个场景：只含 21 个旧名字的白名单得到空步骤快照；追加
+`aiterm_discover` 后发现可用，展开后仍只出现白名单内工具（白名单外的 `aiterm_send` 和整个
+automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mjs`。
+
 边界与限制：
 
 - **每次展开只属于一个 Agent 对象**：子 Agent、fork、恢复（resume）或重开后的新 Agent
@@ -213,6 +254,16 @@ owner 绑定和权限判定都不变；唯一的注册差异是它们会额外�
   `UNKNOWN_TOOL`；`full` 没有这个前置条件。工具多、模型上下文紧张时用 progressive。
 
 ### 切换与回滚（会重载插件）
+
+> **重载的三项既有影响（本分支未改动行为）**：切换 `toolDisclosure`（或本插件行的任何配置）
+> 会重载插件行，并同时发生：
+> ① **关闭所有当前终端**（不保留连接，重开后是新的远端 shell）；
+> ② **清空内存审计**（审计不落盘）；
+> ③ 输出历史虽按保留期留在磁盘，但会话 id 每次启动从 `st-1` 重新计数，新会话可能复用旧 id
+> 并沿用同名日志，**旧输出可能被新会话/新 owner 查到或导出**。
+> 第 ③ 项是既有的跨 owner 历史归属问题（id 复用），不是本次披露改动引入，也未在本分支修复；
+> 历史归属不是安全边界。切换前请确认没有正在跑的命令，并接受需要重开终端、重新发现工具、
+> 重新积累审计。
 
 `toolDisclosure` 是插件行配置，**没有热切换**。修改后 DSH 会重载/重启该插件行：
 
@@ -466,6 +517,7 @@ print('hello from the remote host')
 - 浏览器端把 RPC 前缀硬编码为默认的 `/aiterm`；若改了 `routePath`，需要同步修改 `client/api.js` 并 `npm run build`。
 - 历史检索对**已关闭/重启前**的会话不做权限判定（其权限状态已随会话消失）；活跃会话的读取（含历史检索）仍严格受 AI 权限约束。
 - **历史归属可能被 id 复用污染**：`SessionRegistry.nextId` 每次宿主启动重置为 1，新会话可能复用重启前的 `st-N`；`HistoryStore.openSession` 不会清空同名日志，旧输出会留在新会话的历史文件中：新会话关闭后可通过 `history.query` 读到，`export` 在读日志文件时也会包含它。这是既有行为，本次披露改动未修复。
+- **验证范围**：披露/权限测试跑在真实 DSH `ToolsService`、真实 `SessionRegistry` 和真实权限代码上，但模型侧使用 stub LLM、传输使用内存桩；**没有使用真实 provider/模型，没有测量 token 用量、缓存命中或成本，也没有连接真实 SSH 主机**。因此真实 provider/model/token/cache/cost 与真实 SSH 行为均未验证。
 - 提示符识别是正则启发式，非标准 shell 集成；可通过 `promptPattern` 按需调整。
 - 面板视觉验证需要浏览器环境；本项目环境无浏览器控制能力，界面仅做了构建与注册级验证。
 
