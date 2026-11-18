@@ -2446,10 +2446,18 @@ await closePanelViaBar()
 
   // ── history panel: export (current / all) + auto-log switch ────────────
   let raceResolve = null
+  let raceReject = null
   let raceActive = false
+  let legacyRaceResolve = null
+  let legacyRaceActive = false
+  let reloadResolve = null
+  let reloadActive = false
   scene.handlers.set('history.sessions', async (params) => {
+    if (reloadActive && (params.offset === undefined || params.offset === 0)) {
+      return await new Promise((resolve) => { reloadResolve = resolve })
+    }
     if (raceActive && params.offset === 1) {
-      return await new Promise((resolve) => { raceResolve = resolve })
+      return await new Promise((resolve, reject) => { raceResolve = resolve; raceReject = reject })
     }
     if (params.offset === 1 && params.snapshot === 'snap-1') {
       return { sessions: [], total: 2, truncated: true, stale: true, snapshot: 'snap-2' }
@@ -2464,11 +2472,19 @@ await closePanelViaBar()
     }
   })
   scene.handlers.set('history.query', async () => ({ matches: [], scannedBytes: 0 }))
-  scene.handlers.set('history.legacy.sessions', async () => ({
-    sessions: [
-      { id: 'st-legacy', title: 'old-unowned', transport: 'ssh', host: 'old.example', port: 22, username: 'old', createdAt: now - 120_000, bytes: 100, lastTs: now - 100_000 },
-    ],
-  }))
+  scene.handlers.set('history.legacy.sessions', async () => {
+    if (legacyRaceActive) {
+      return await new Promise((resolve) => { legacyRaceResolve = resolve })
+    }
+    return {
+      sessions: [
+        { id: 'st-legacy', title: 'old-unowned', transport: 'ssh', host: 'old.example', port: 22, username: 'old', createdAt: now - 120_000, bytes: 100, lastTs: now - 100_000 },
+      ],
+      total: 1,
+      truncated: false,
+      snapshot: 'legacy-snap-1',
+    }
+  })
   scene.handlers.set('history.legacy.query', async () => ({ matches: [{ at: now, line: 'LEGACY-OUT', before: [], after: [] }], scannedBytes: 50, truncated: false }))
   scene.handlers.set('history.legacy.export', async (params) => ({
     dir: '/home/u/.dsh/aiterm/exports',
@@ -2536,28 +2552,30 @@ await closePanelViaBar()
     assert.ok(textOf(lastTree).includes(dict('historyStaleReload').slice(0, 8)), 'the stale reload must be explained')
   }
 
-  // A normal loadMore that resolves after switching to legacy must not paint
-  // into the legacy page (real bundle async race).
+  // A normal loadMore that fails after switching to a slow legacy load must not
+  // paint, error, or leave a clickable old Load more (real bundle async race).
   {
     raceActive = true
+    legacyRaceActive = true
     await clickNode(findButtonByText(dict('historyLoadMore')), 'start racing normal page')
     await settle('normal page pending')
     await clickNode(findButtonByText(dict('historyLegacyEntry')), 'switch to legacy while normal page pending')
-    await settle('legacy page loaded')
-    assert.ok(textOf(lastTree).includes('old-unowned'), 'legacy list must render while the normal page is pending')
-    assert.equal(typeof raceResolve, 'function')
-    raceResolve({
-      sessions: [
-        { id: 'st-ssh-race', title: 'normal-race', transport: 'ssh', host: '10.0.0.5', port: 22, username: 'root', createdAt: now - 30_000, bytes: 10, lastTs: now },
-      ],
-      total: 2,
-      truncated: false,
-      snapshot: 'snap-race',
-    })
-    await settle('late normal page resolved')
-    assert.equal(textOf(lastTree).includes('normal-race'), false, 'a stale normal response must not paint the legacy page')
-    assert.ok(textOf(lastTree).includes('old-unowned'), 'the legacy page must remain authoritative')
+    await settle('legacy page pending')
+    assert.ok(!findButtonByText(dict('historyLoadMore')), 'the old Load more must disappear on source switch')
+    assert.ok(
+      !collect(lastTree, (node) => node.props && node.props.role === 'option').some((node) => textOf(node).includes('web-1')),
+      'the old normal list must be cleared on source switch',
+    )
+    assert.equal(typeof legacyRaceResolve, 'function')
+    assert.equal(typeof raceReject, 'function')
+    raceReject(new Error('late normal failure'))
+    await settle('late normal failure ignored')
+    assert.equal(textOf(lastTree).includes('late normal failure'), false, 'a late normal failure must not paint the legacy page')
+    legacyRaceResolve({ sessions: [{ id: 'st-legacy', title: 'old-unowned', transport: 'ssh', host: 'old.example', port: 22, username: 'old', createdAt: now - 120_000, bytes: 100, lastTs: now - 100_000 }], total: 1, truncated: false, snapshot: 'legacy-snap-2' })
+    await settle('slow legacy page resolved')
+    assert.ok(textOf(lastTree).includes('old-unowned'), 'the legacy page must render after its slow response')
     raceActive = false
+    legacyRaceActive = false
     await clickNode(findButtonByText(dict('historyLegacyBack')), 'return from race legacy')
     await settle('returned to normal history')
   }
@@ -2618,6 +2636,27 @@ await closePanelViaBar()
     assert.ok(textOf(lastTree).includes(dict('historyAutoLogOn')), 'the toast must confirm the switch')
     assert.ok(textOf(lastTree).includes(dict('historyAutoLogWhere').split('{')[0]), 'the writing directory must be shown')
   }
+
+  // A delayed initial normal load that resolves after switching to legacy must
+  // not overwrite the legacy page either (initial-load race, not just loadMore).
+  await closePanelViaBar()
+  reloadActive = true
+  await openPanelViaBar('history')
+  await settle('initial normal load pending')
+  await clickNode(findButtonByText(dict('historyLegacyEntry')), 'enter legacy during initial load')
+  await settle('legacy during initial load')
+  assert.ok(textOf(lastTree).includes('old-unowned'), 'legacy must render before the initial normal response')
+  assert.equal(typeof reloadResolve, 'function')
+  reloadResolve({
+    sessions: [{ id: 'st-ssh-initial', title: 'normal-initial', transport: 'ssh', host: '10.0.0.5', port: 22, username: 'root', createdAt: now - 20_000, bytes: 10, lastTs: now }],
+    total: 1,
+    truncated: false,
+    snapshot: 'initial-snap',
+  })
+  await settle('late initial normal resolved')
+  assert.equal(textOf(lastTree).includes('normal-initial'), false, 'a late initial normal response must not overwrite legacy')
+  assert.ok(textOf(lastTree).includes('old-unowned'), 'legacy remains after the late initial response')
+  reloadActive = false
 
   await closePanelViaBar()
   await setSessions([sessionRecord()])

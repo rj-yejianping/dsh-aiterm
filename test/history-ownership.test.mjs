@@ -2834,3 +2834,95 @@ test('live output does not invalidate a page snapshot, but close/reorder does', 
     await registry.dispose()
   })
 })
+
+test('aiterm_history render exposes the paging snapshot and stale/limit hints to the model', async () => {
+  const definitions = new Map()
+  const ctx = {
+    tools: { register(definition) { definitions.set(definition.name, definition); return () => {} }, get() { return undefined } },
+    effect(run) { run(); return () => {} },
+    inject() {},
+    on() {},
+  }
+  registerTools(ctx, {
+    config: resolveConfig({ ...DEFAULT_CONFIG, toolDisclosure: 'full' }),
+    registry: {},
+    scripts: undefined,
+    profiles: {},
+  })
+  const tool = definitions.get('aiterm_history')
+  assert.ok(tool)
+  const textOf = (args, value) => tool.output.render(args, value).map((entry) => entry.text).join('\n')
+  const sessions = [{ id: 'st-1', title: 't', transport: 'ssh', host: 'h', port: 22, createdAt: T0, bytes: 1 }]
+
+  const normal = textOf({ limit: 1, offset: 0 }, { sessions, total: 10, truncated: true, snapshot: 'SNAP-1' })
+  assert.ok(normal.includes('snapshot: SNAP-1'), 'the model-facing render must contain the snapshot token')
+  assert.ok(normal.includes('offset=1'), 'the render must tell the model how to request page 2')
+
+  const stale = textOf({ offset: 1, snapshot: 'OLD' }, { sessions: [], total: 10, truncated: true, stale: true, snapshot: 'SNAP-2' })
+  assert.ok(stale.includes('snapshot: SNAP-2'))
+  assert.ok(stale.toLowerCase().includes('restart'))
+
+  const limit = textOf({ offset: 19999 }, { sessions: [], total: 20001, truncated: true, limitReached: true, snapshot: 'SNAP-3' })
+  assert.ok(limit.includes('source limit'))
+  assert.ok(limit.includes('snapshot: SNAP-3'))
+})
+
+test('source-limit paging stays usable until the fetched boundary and legacy total is not undercounted', async () => {
+  await withDir(async (dir) => {
+    const recording = (index, owner = 'owner-a') => ({
+      id: `st-${index}`,
+      historyId: `st-${index}~h`,
+      owner,
+      title: `st-${index}`,
+      transport: 'ssh',
+      host: 'h',
+      port: 22,
+      username: 'u',
+      createdAt: T0 + index,
+      lastTs: T0 + index,
+      closedAt: T0 + index + 1,
+      bytes: 1,
+    })
+    const recordings = Array.from({ length: 20_000 }, (_, index) => recording(index))
+    const fake = {
+      async listRecordingsPage() {
+        return { recordings, total: 20_001, truncated: true, snapshot: 'recordings' }
+      },
+      async listLegacySessionsPage() {
+        return { sessions: [], total: 0, truncated: false, snapshot: 'legacy-none' }
+      },
+    }
+    const registry = makeRegistry(dir, fake)
+    const first = await registry.historySessionsPage({ owner: 'owner-a', actor: 'human', limit: 50, offset: 0 })
+    assert.equal(first.sessions.length, 50)
+    assert.equal(first.total, 20_001)
+    assert.equal(first.limitReached, false, 'the first page must remain pageable')
+    const boundary = await registry.historySessionsPage({ owner: 'owner-a', actor: 'human', limit: 50, offset: 19_950 })
+    assert.equal(boundary.sessions.length, 50)
+    assert.equal(boundary.limitReached, true, 'only the fetched boundary disables Load more')
+    const beyond = await registry.historySessionsPage({ owner: 'owner-a', actor: 'human', limit: 50, offset: 20_000 })
+    assert.equal(beyond.sessions.length, 0)
+    assert.equal(beyond.limitReached, true)
+    await registry.dispose()
+
+    const legacySessions = Array.from({ length: 20_000 }, (_, index) => ({
+      id: `legacy-${index}`, title: 'legacy', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + index, lastTs: T0 + index,
+    }))
+    const mixed = {
+      async listRecordingsPage() {
+        return { recordings: [recording(0, null)], total: 1, truncated: false, snapshot: 'one' }
+      },
+      async listLegacySessionsPage() {
+        return { sessions: legacySessions, total: 100_000, truncated: true, snapshot: 'legacy-many' }
+      },
+    }
+    const mixedRegistry = makeRegistry(dir, mixed)
+    const merged = await mixedRegistry.historySessionsPage({ owner: null, actor: 'human', limit: 50, offset: 0 })
+    assert.equal(merged.total, 100_001, 'truncated legacy total must not be reduced to the fetched page count')
+    assert.equal(merged.limitReached, false)
+    const mergedBoundary = await mixedRegistry.historySessionsPage({ owner: null, actor: 'human', limit: 50, offset: 19_999 })
+    assert.equal(mergedBoundary.sessions.length, 2)
+    assert.equal(mergedBoundary.limitReached, true)
+    await mixedRegistry.dispose()
+  })
+})

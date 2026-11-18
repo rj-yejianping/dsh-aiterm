@@ -148,8 +148,8 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         const list = raw && Array.isArray(raw.sessions)
           ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
           : []
-        // Newest first, including closed sessions (CONTRACTS.md §12.3).
-        list.sort((left, right) => (right.lastTs || right.createdAt) - (left.lastTs || left.createdAt))
+        // Preserve the server's authoritative page order (live first, then
+        // closed sessions by activity); page 2 is appended in the same order.
         setSessions(list)
         setListState(list.length > 0 ? 'ready' : 'empty')
         setListTruncated(raw?.truncated === true)
@@ -401,6 +401,13 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   /** Load the normal owner-scoped list (also used when leaving legacy mode). */
   const loadNormal = async () => {
     const token = ++loadTokenRef.current
+    setLoadMoreBusy(false)
+    setSessions([])
+    setListTruncated(false)
+    setListLimitReached(false)
+    setListTotal(0)
+    setListSnapshot('')
+    setListRawCount(0)
     setListState('loading')
     setListError(null)
     try {
@@ -409,7 +416,6 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       const list = raw && Array.isArray(raw.sessions)
         ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
         : []
-      list.sort((left, right) => (right.lastTs || right.createdAt) - (left.lastTs || left.createdAt))
       setSessions(list)
       setListState(list.length > 0 ? 'ready' : 'empty')
       setListTruncated(raw?.truncated === true)
@@ -432,12 +438,19 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   }
 
   /** Open the explicit human-only legacy view. */
-  const enterLegacy = async () => {
-    if (legacyBusy) return
+  const enterLegacy = async (force = false) => {
+    if (legacyBusy && force !== true) return
     const token = ++loadTokenRef.current
+    setLoadMoreBusy(false)
     setLegacyBusy(true)
     requestRef.current += 1
     setLegacyMode(true)
+    setSessions([])
+    setListTruncated(false)
+    setListLimitReached(false)
+    setListTotal(0)
+    setListSnapshot('')
+    setListRawCount(0)
     // Drop the normal selection before switching sources so the query effect
     // never runs the old owner-scoped id through the legacy RPC.
     setPickedId(null)
@@ -455,7 +468,6 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       const list = raw && Array.isArray(raw.sessions)
         ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
         : []
-      list.sort((left, right) => (right.lastTs || right.createdAt) - (left.lastTs || left.createdAt))
       setSessions(list)
       setListState(list.length > 0 ? 'ready' : 'empty')
       setListTruncated(raw?.truncated === true)
@@ -470,7 +482,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListError(errorMessage(error))
       setListState('error')
     } finally {
-      setLegacyBusy(false)
+      if (aliveRef.current && token === loadTokenRef.current) setLegacyBusy(false)
     }
   }
 
@@ -478,9 +490,16 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const leaveLegacy = async () => {
     if (legacyBusy) return
     loadTokenRef.current += 1
+    setLoadMoreBusy(false)
     setLegacyBusy(true)
     requestRef.current += 1
     setLegacyMode(false)
+    setSessions([])
+    setListTruncated(false)
+    setListLimitReached(false)
+    setListTotal(0)
+    setListSnapshot('')
+    setListRawCount(0)
     setPickedId(null)
     setPickedHistoryId(null)
     setExported(null)
@@ -510,7 +529,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         // could skip rows; reload from the first page instead of silently
         // claiming the list is complete.
         notify(t('historyStaleReload'))
-        if (modeAtStart) await enterLegacy()
+        if (modeAtStart) await enterLegacy(true)
         else await loadNormal()
         return
       }
@@ -524,6 +543,8 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         seen.add(key)
         return true
       })
+      // The server already returns the authoritative page order (live first,
+      // then closed logs by activity). Preserve it; do not re-sort here.
       setSessions([...sessions, ...appended])
       setListTruncated(raw?.truncated === true)
       setListTotal(typeof raw?.total === 'number' ? raw.total : listTotal)
@@ -531,9 +552,10 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListRawCount(offsetAtStart + more.length)
       setListLimitReached(raw?.limitReached === true)
     } catch (error) {
+      if (!aliveRef.current || token !== loadTokenRef.current || modeAtStart !== legacyModeRef.current) return
       notify(fmt(t, 'historySessionsFailed', { message: errorMessage(error) }))
     } finally {
-      setLoadMoreBusy(false)
+      if (aliveRef.current && token === loadTokenRef.current) setLoadMoreBusy(false)
     }
   }
 
@@ -609,7 +631,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
               : fmt(t, 'historySessionsTruncated', { shown: sessions.length, total: listTotal })}
           </span>
           {listLimitReached ? null : (
-            <Btn onClick={loadMore} busy={loadMoreBusy} disabled={loadMoreBusy}>
+            <Btn onClick={loadMore} busy={loadMoreBusy} disabled={loadMoreBusy || legacyBusy}>
               {t('historyLoadMore')}
             </Btn>
           )}
