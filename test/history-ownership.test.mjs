@@ -16,12 +16,13 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { AutoLog } from '../lib/host/autolog.js'
 import { DEFAULT_CONFIG, resolveConfig } from '../lib/host/config.js'
+import { exportSessions } from '../lib/host/exporter.js'
 import { HistoryStore } from '../lib/host/history-store.js'
 import { SessionRegistry } from '../lib/host/registry.js'
 import { registerTools } from '../lib/host/tools.js'
@@ -795,6 +796,571 @@ test('the human panel can still change automatic log settings', async () => {
     const next = await registry.autolog.set({ enabled: true, dir: join(dir, 'machine-logs') })
     assert.equal(next.enabled, true)
     assert.equal(registry.autolog.get().enabled, true)
+    await registry.dispose()
+  })
+})
+
+
+/* ------------------------------------------------------------------ *
+ * 7. Identity allocation and per-incarnation addressability.
+ * ------------------------------------------------------------------ */
+
+test('session ids stay unique across a restart and across concurrent registries', async () => {
+  await withDir(async (dir) => {
+    const firstStore = makeStore(dir)
+    await firstStore.init()
+    const first = makeRegistry(dir, firstStore)
+    first.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const firstSession = await first.create({ transport: 'telnet', host: '10.0.0.1', port: 23 }, 'ai', 'owner-a')
+    await first.close(firstSession.id, 'test', 'human', 'owner-a')
+    await settle(firstStore)
+    await first.dispose()
+
+    // Restart: the persisted allocation must not hand out st-1 again.
+    const secondStore = makeStore(dir)
+    await secondStore.init()
+    const second = makeRegistry(dir, secondStore)
+    second.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const secondSession = await second.create({ transport: 'telnet', host: '10.0.0.1', port: 23 }, 'ai', 'owner-a')
+    assert.notEqual(secondSession.id, firstSession.id, 'a restart must not reuse a recorded st-N')
+
+    const list = await second.historySessions({ owner: 'owner-a', actor: 'ai' })
+    const ids = new Set(list.map((entry) => entry.id))
+    assert.equal(ids.has(firstSession.id), true, 'the pre-restart history must remain addressable')
+    assert.equal(ids.has(secondSession.id), true)
+
+    // Two simultaneous instances on the same directory must not collide.
+    const [leftStore, rightStore] = [makeStore(dir), makeStore(dir)]
+    await Promise.all([leftStore.init(), rightStore.init()])
+    const [left, right] = [makeRegistry(dir, leftStore), makeRegistry(dir, rightStore)]
+    left.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    right.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const [leftSession, rightSession] = await Promise.all([
+      left.create({ transport: 'telnet', host: '10.0.0.2', port: 23 }, 'ai', 'owner-left'),
+      right.create({ transport: 'telnet', host: '10.0.0.3', port: 23 }, 'ai', 'owner-right'),
+    ])
+    assert.notEqual(leftSession.id, rightSession.id, 'concurrent instances must reserve different ids')
+    await left.dispose()
+    await right.dispose()
+    await second.dispose()
+  })
+})
+
+test('every incarnation is listed and can be addressed and exported by historyId', async () => {
+  await withDir(async (dir) => {
+    const firstStore = makeStore(dir)
+    await firstStore.init()
+    await firstStore.openSession({
+      id: 'st-1', owner: 'owner-same', title: 'first', transport: 'ssh', host: 'first.example', port: 22, username: 'u', createdAt: T0,
+    })
+    firstStore.appendChunk('st-1', 'FIRST-INCARNATION\n', T0 + 1, 'owner-same')
+    await firstStore.closeSession('st-1', { owner: 'owner-same', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await settle(firstStore)
+
+    const secondStore = makeStore(dir)
+    await secondStore.init()
+    await secondStore.openSession({
+      id: 'st-1', owner: 'owner-same', title: 'second', transport: 'ssh', host: 'second.example', port: 22, username: 'u', createdAt: T0 + 3,
+    })
+    secondStore.appendChunk('st-1', 'SECOND-INCARNATION\n', T0 + 4, 'owner-same')
+    await secondStore.closeSession('st-1', { owner: 'owner-same', closedAt: T0 + 5, permission: { aiAccess: 'wo' } })
+    await settle(secondStore)
+
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    const list = await registry.historySessions({ owner: 'owner-same', actor: 'human' })
+    const sameId = list.filter((entry) => entry.id === 'st-1')
+    assert.equal(sameId.length, 2, 'both incarnations must remain listed')
+    const historyIds = new Set(sameId.map((entry) => entry.historyId))
+    assert.equal(historyIds.size, 2, 'each incarnation must have its own address')
+    assert.equal([...historyIds].some((value) => typeof value !== 'string' || value.length === 0), false)
+
+    const firstEntry = sameId.find((entry) => entry.title === 'first')
+    const secondEntry = sameId.find((entry) => entry.title === 'second')
+    const firstResult = await registry.historyQuery({
+      sessionId: 'st-1', historyId: firstEntry.historyId, owner: 'owner-same', actor: 'human', search: 'FIRST-INCARNATION',
+    })
+    assert.equal(firstResult.matches.length, 1)
+    const secondResult = await registry.historyQuery({
+      sessionId: 'st-1', historyId: secondEntry.historyId, owner: 'owner-same', actor: 'human', search: 'SECOND-INCARNATION',
+    })
+    assert.equal(secondResult.matches.length, 1)
+    const crossed = await registry.historyQuery({
+      sessionId: 'st-1', historyId: firstEntry.historyId, owner: 'owner-same', actor: 'human', search: 'SECOND-INCARNATION',
+    })
+    assert.equal(crossed.matches.length, 0, 'a historyId must never merge the other incarnation')
+
+    const firstExport = await registry.exportHistory({
+      sessionId: 'st-1', historyId: firstEntry.historyId, owner: 'owner-same', actor: 'human',
+    })
+    const firstText = await readFile(firstExport.files[0].path, 'utf8')
+    assert.equal(firstText.includes('FIRST-INCARNATION'), true)
+    assert.equal(firstText.includes('SECOND-INCARNATION'), false)
+    const secondExport = await registry.exportHistory({
+      sessionId: 'st-1', historyId: secondEntry.historyId, owner: 'owner-same', actor: 'human',
+    })
+    const secondText = await readFile(secondExport.files[0].path, 'utf8')
+    assert.equal(secondText.includes('SECOND-INCARNATION'), true)
+    assert.equal(secondText.includes('FIRST-INCARNATION'), false)
+    assert.notEqual(firstExport.files[0].path, secondExport.files[0].path, 'each incarnation needs a distinct export file')
+
+    // AI permission is per incarnation: the first is rw, the second is wo.
+    const firstAi = await registry.historyQuery({
+      sessionId: 'st-1', historyId: firstEntry.historyId, owner: 'owner-same', actor: 'ai', search: 'FIRST-INCARNATION',
+    })
+    assert.equal(firstAi.matches.length, 1)
+    await rejectsWithCode(
+      () => registry.historyQuery({ sessionId: 'st-1', historyId: secondEntry.historyId, owner: 'owner-same', actor: 'ai' }),
+      'AI_READ_DENIED',
+    )
+    // Another owner can never use a leaked historyId.
+    await rejectsWithCode(
+      () => registry.historyQuery({ sessionId: 'st-1', historyId: firstEntry.historyId, owner: 'owner-other', actor: 'ai' }),
+      'SESSION_NOT_FOUND',
+    )
+    await registry.dispose()
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 8. Close and export failure paths.
+ * ------------------------------------------------------------------ */
+
+test('a failed reservation never lets close stamp an unrelated crash journal', async () => {
+  await withDir(async (dir) => {
+    // A previous incarnation crashed after flushing bytes but before close.
+    const oldStore = makeStore(dir)
+    await oldStore.init()
+    await oldStore.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'crashed', transport: 'ssh', host: 'old.example', port: 22, username: 'u', createdAt: T0,
+    })
+    oldStore.appendChunk('st-1', 'CRASHED-DATA\n', T0 + 1, 'owner-a')
+    await oldStore.flush('st-1')
+    await oldStore.dispose()
+
+    class FailingReservationStore extends HistoryStore {
+      async reserveJournal() {
+        return undefined
+      }
+    }
+    const broken = new FailingReservationStore({ dir, flushIntervalMs: 5, log: () => {} })
+    await broken.init()
+    const opened = await broken.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'new', transport: 'ssh', host: 'new.example', port: 22, username: 'u', createdAt: T0 + 2,
+    })
+    assert.equal(opened, false, 'the reservation failure must be reported')
+    await broken.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 3, permission: { aiAccess: 'rw' } })
+    await settle(broken)
+
+    const fresh = makeStore(dir)
+    await fresh.init()
+    const registry = makeRegistry(dir, fresh)
+    await rejectsWithCode(
+      () => registry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai' }),
+      'AI_READ_DENIED',
+      'permission for the crashed incarnation must stay unknown',
+    )
+    const human = await registry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'human', search: 'CRASHED-DATA' })
+    assert.equal(human.matches.length, 1)
+    await registry.dispose()
+  })
+})
+
+test('live journal resolution re-checks the owner instead of trusting the id', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'a', transport: 'ssh', host: 'a.example', port: 22, username: 'u', createdAt: T0,
+    })
+    await store.openSession({
+      id: 'st-1', owner: 'owner-b', title: 'b', transport: 'ssh', host: 'b.example', port: 22, username: 'u', createdAt: T0 + 1,
+    })
+    assert.equal(store.activeJournal('st-1', 'owner-a'), undefined, 'owner A must not resolve owner B active journal')
+    assert.ok(store.activeJournal('st-1', 'owner-b'))
+  })
+})
+
+test('an export waits for an unfinished journal reservation', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const original = store.openSession.bind(store)
+    let release
+    const gate = new Promise((resolve) => {
+      release = resolve
+    })
+    store.openSession = async (meta) => {
+      await gate
+      return original(meta)
+    }
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const info = await registry.create({ transport: 'telnet', host: '10.0.0.9', port: 23 }, 'ai', 'owner-early')
+    registry.handleData(registry.sessions.get(info.id), 'EARLY-EXPORT\n')
+    const pending = registry.exportHistory({ sessionId: info.id, owner: 'owner-early', actor: 'ai' })
+    release()
+    const result = await pending
+    assert.equal(result.files.length, 1)
+    const text = await readFile(result.files[0].path, 'utf8')
+    assert.equal(text.includes('EARLY-EXPORT'), true)
+    await registry.dispose()
+  })
+})
+
+test('a failed close flush keeps the bytes and does not stamp a permission', async () => {
+  await withDir(async (dir) => {
+    let failures = 1
+    class FailingAppendStore extends HistoryStore {
+      async appendJournal(file, data) {
+        if (failures > 0) {
+          failures -= 1
+          throw new Error('simulated append failure')
+        }
+        return super.appendJournal(file, data)
+      }
+    }
+    const store = new FailingAppendStore({
+      dir,
+      retentionMs: 3_600_000,
+      maxBytesPerSession: 1_000_000,
+      maxSessions: 100,
+      flushIntervalMs: 60_000,
+      log: () => {},
+    })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'flush', transport: 'ssh', host: 'a.example', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'FLUSH-MUST-SURVIVE\n', T0 + 1, 'owner-a')
+    const journal = store.activeJournal('st-1', 'owner-a')
+    assert.ok(journal)
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    const failedRaw = await readFile(journal, 'utf8')
+    assert.equal(failedRaw.includes('FLUSH-MUST-SURVIVE'), false, 'the simulated append failed before bytes reached disk')
+    assert.equal(failedRaw.includes('"_aiterm":"close"'), false, 'a failed flush must not stamp a close permission')
+
+    // The bytes are still buffered; restoring the writer flushes them.
+    await store.flush('st-1')
+    const raw = await readFile(journal, 'utf8')
+    assert.equal(decodedOutput(raw).includes('FLUSH-MUST-SURVIVE'), true, 'the close flush bytes must be retained and retryable')
+    assert.equal(raw.includes('"_aiterm":"close"'), false, 'the permission may only be stamped after a successful flush')
+
+    // Unknown permission after the failed close: AI fails closed, human reads.
+    const blocked = makeStore(dir)
+    await blocked.init()
+    const blockedRegistry = makeRegistry(dir, blocked)
+    await rejectsWithCode(
+      () => blockedRegistry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai' }),
+      'AI_READ_DENIED',
+    )
+    const human = await blockedRegistry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'human', search: 'FLUSH-MUST-SURVIVE' })
+    assert.equal(human.matches.length, 1)
+    await blockedRegistry.dispose()
+
+    // A later close retry records the permission normally.
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 3, permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const recovered = makeStore(dir)
+    await recovered.init()
+    const recoveredRegistry = makeRegistry(dir, recovered)
+    const ai = await recoveredRegistry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai', search: 'FLUSH-MUST-SURVIVE' })
+    assert.equal(ai.matches.length, 1)
+    await recoveredRegistry.dispose()
+  })
+})
+
+test('an explicit export of a vanished journal fails instead of writing an empty file', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'gone', transport: 'ssh', host: 'a.example', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'GONE-DATA\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const journal = store.journalForSync('st-1', { owner: 'owner-a', actor: 'human' })
+    assert.ok(journal)
+    await rm(journal, { force: true })
+
+    const registry = makeRegistry(dir, store)
+    await rejectsWithCode(
+      () => registry.exportHistory({ sessionId: 'st-1', owner: 'owner-a', actor: 'human' }),
+      'SESSION_NOT_FOUND',
+    )
+    await registry.dispose()
+  })
+})
+
+test('closed history search is case-insensitive like live history search', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'case', transport: 'ssh', host: 'a.example', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'SecretTokenValue\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const registry = makeRegistry(dir, store)
+    const result = await registry.historyQuery({ sessionId: 'st-1', owner: 'owner-a', actor: 'ai', search: 'secrettokenvalue' })
+    assert.equal(result.matches.length, 1, 'search must not silently differ between live and closed sessions')
+    await registry.dispose()
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 9. Explicit human-only legacy history access.
+ * ------------------------------------------------------------------ */
+
+test('the owner-bound panel has a human-only legacy bucket that never attributes or edits old files', async () => {
+  await withDir(async (dir) => {
+    const legacy = `${JSON.stringify({ t: T0, d: payload('UNOWNED-OLD\n') })}\n`
+    await writeFile(join(dir, 'st-1.ndjson'), legacy, { mode: 0o600 })
+    await writeFile(join(dir, 'st-9.ndjson'), `${JSON.stringify({ t: T0, d: payload('ORPHAN\n') })}\n`, { mode: 0o600 })
+    await writeFile(
+      join(dir, 'index.json'),
+      `${JSON.stringify({
+        version: 1,
+        sessions: [{ id: 'st-1', title: 'old unowned', transport: 'ssh', host: 'old.example', port: 22, username: 'old', createdAt: T0, lastTs: T0 }],
+      })}\n`,
+      { mode: 0o600 },
+    )
+
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+
+    const list = await registry.legacyHistorySessions({ actor: 'human' })
+    assert.deepEqual(list.map((entry) => entry.id), ['st-1'])
+    const query = await registry.legacyHistoryQuery({ actor: 'human', sessionId: 'st-1', search: 'UNOWNED-OLD' })
+    assert.equal(query.matches.length, 1)
+    const exported = await registry.legacyHistoryExport({ actor: 'human', sessionId: 'st-1' })
+    assert.equal(exported.files.length, 1)
+    assert.equal((await readFile(exported.files[0].path, 'utf8')).includes('UNOWNED-OLD'), true)
+
+    // The explicit view never rewrites, renames or attributes the old file.
+    assert.equal(await readFile(join(dir, 'st-1.ndjson'), 'utf8'), legacy)
+    const again = await registry.legacyHistorySessions({ actor: 'human' })
+    assert.equal(again.length, 1)
+    assert.equal(again[0].owner, undefined)
+    assert.equal(again[0].historyId, undefined)
+
+    // Orphans still never appear, even in the explicit human bucket.
+    await rejectsWithCode(() => registry.legacyHistoryQuery({ actor: 'human', sessionId: 'st-9' }), 'SESSION_NOT_FOUND')
+    await rejectsWithCode(() => registry.legacyHistoryExport({ actor: 'human', sessionId: 'st-9' }), 'SESSION_NOT_FOUND')
+
+    // No AI path exists through these methods.
+    await rejectsWithCode(() => registry.legacyHistorySessions({ actor: 'ai' }), 'HUMAN_ONLY')
+    await rejectsWithCode(() => registry.legacyHistoryQuery({ actor: 'ai', sessionId: 'st-1' }), 'HUMAN_ONLY')
+    await rejectsWithCode(() => registry.legacyHistoryExport({ actor: 'ai', sessionId: 'st-1' }), 'HUMAN_ONLY')
+
+    // The normal owner-bound view still excludes legacy data.
+    const normal = await registry.historySessions({ actor: 'human', owner: 'owner-real' })
+    assert.deepEqual(normal, [])
+    await registry.dispose()
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 10. Automatic-log legacy settings migration.
+ * ------------------------------------------------------------------ */
+
+test('a legacy enabled autolog setting is preserved but stays off until the human confirms', async () => {
+  await withDir(async (dir) => {
+    const settingsFile = join(dir, 'settings.json')
+    const logsDir = join(dir, 'old-logs')
+    const original = `${JSON.stringify({
+      version: 1,
+      other: { keep: true },
+      autolog: { enabled: true, dir: logsDir },
+    }, null, 2)}\n`
+    await writeFile(settingsFile, original, { mode: 0o600 })
+
+    const autolog = new AutoLog({ dataDir: dir, settingsFile, log: () => {} })
+    await autolog.init()
+    const pending = autolog.get()
+    assert.equal(pending.enabled, false, 'the unsafe persisted value must not start writing after upgrade')
+    assert.equal(pending.needsReview, true)
+    assert.equal(pending.dir, logsDir, 'the original directory is preserved for the human decision')
+    assert.equal(await readFile(settingsFile, 'utf8'), original, 'loading must not rewrite the real settings file')
+
+    await autolog.set({ enabled: false })
+    const off = autolog.get()
+    assert.equal(off.enabled, false)
+    assert.equal(off.needsReview, false)
+    assert.equal(off.dir, logsDir, 'confirming keep-off preserves the configured directory')
+    const saved = JSON.parse(await readFile(settingsFile, 'utf8'))
+    assert.equal(saved.autolog.enabled, false)
+    assert.equal(saved.autolog.dir, logsDir)
+    assert.equal(typeof saved.autolog.reviewedAt, 'number')
+    assert.deepEqual(saved.other, { keep: true }, 'unrelated settings survive the write')
+    await autolog.dispose()
+  })
+})
+
+test('the human can explicitly re-enable a legacy autolog setting', async () => {
+  await withDir(async (dir) => {
+    const settingsFile = join(dir, 'settings.json')
+    const logsDir = join(dir, 'old-logs')
+    await writeFile(
+      settingsFile,
+      `${JSON.stringify({ version: 1, autolog: { enabled: true, dir: logsDir } })}\n`,
+      { mode: 0o600 },
+    )
+    const autolog = new AutoLog({ dataDir: dir, settingsFile, log: () => {} })
+    await autolog.init()
+    assert.equal(autolog.get().needsReview, true)
+    const enabled = await autolog.set({ enabled: true })
+    assert.equal(enabled.enabled, true)
+    assert.equal(enabled.needsReview, false)
+    const saved = JSON.parse(await readFile(settingsFile, 'utf8'))
+    assert.equal(saved.autolog.enabled, true)
+    assert.equal(saved.autolog.dir, logsDir)
+    assert.equal(typeof saved.autolog.reviewedAt, 'number')
+    await autolog.dispose()
+  })
+})
+
+
+/* ------------------------------------------------------------------ *
+ * 11. Bounded scans, export size and audit.
+ * ------------------------------------------------------------------ */
+
+test('unknown history ids do not trigger one directory scan per request', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const baseline = store.scanCount
+    for (let index = 0; index < 25; index += 1) {
+      await store.resolveForRead(`st-${10_000 + index}`, 'owner-a', 'ai')
+    }
+    assert.ok(store.scanCount - baseline <= 1, `misses must not rescan the directory each time (scans: ${store.scanCount - baseline})`)
+  })
+})
+
+test('export refuses an oversized journal instead of materializing it', async () => {
+  await withDir(async (dir) => {
+    const journal = join(dir, 'huge.ndjson')
+    await writeFile(journal, `${JSON.stringify({ t: T0, d: payload('X'.repeat(200)) })}\n`, { mode: 0o600 })
+    const out = join(dir, 'exports')
+    const fakeStore = {
+      fileFor: () => journal,
+      flush: async () => {},
+      listSessions: async () => [{
+        id: 'st-1', title: 'huge', transport: 'ssh', host: 'h.example', port: 22, username: 'u', createdAt: T0, bytes: 200, lastTs: T0,
+      }],
+    }
+    await assert.rejects(
+      () => exportSessions({ historyStore: fakeStore, dir: out, sessionId: 'st-1', maxJournalBytes: 10 }),
+      (error) => {
+        assert.equal(error?.code, 'HISTORY_TOO_LARGE')
+        return true
+      },
+    )
+    assert.deepEqual(await readdir(out), [], 'no partial/empty export may be written')
+  })
+})
+
+test('live history reads and exports are recorded in the session audit', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const info = await registry.create({ transport: 'telnet', host: '10.0.0.4', port: 23 }, 'ai', 'owner-audit')
+    const record = registry.sessions.get(info.id)
+    registry.handleData(record, 'AUDIT-ME\n')
+    await registry.historyQuery({ sessionId: info.id, owner: 'owner-audit', actor: 'ai' })
+    assert.ok(record.audit.some((entry) => entry.action === 'read' && entry.detail === 'history:slice'))
+    await registry.exportHistory({ sessionId: info.id, owner: 'owner-audit', actor: 'ai' })
+    assert.ok(record.audit.some((entry) => entry.action === 'read' && entry.detail === 'export'))
+    await registry.dispose()
+  })
+})
+
+test('id allocation skips ids occupied by an old automatic-log file', async () => {
+  await withDir(async (dir) => {
+    const logsDir = join(dir, 'logs')
+    await mkdir(logsDir, { recursive: true })
+    await writeFile(join(logsDir, 'st-1.log'), 'OLD OWNER OUTPUT\n', { mode: 0o600 })
+
+    const store = makeStore(dir)
+    await store.init()
+    const id = await store.allocateSessionId({
+      isIdAvailable: async (candidate) => !(await new AutoLog({ dataDir: dir, dir: logsDir, log: () => {} }).hasLog(candidate)),
+    })
+    assert.notEqual(id, 'st-1', 'an existing <id>.log must force a different session id')
+
+    const autolog = new AutoLog({ dataDir: dir, dir: logsDir, log: () => {} })
+    await autolog.init()
+    const registry = new SessionRegistry({
+      config: resolveConfig({ aiAccessDefault: 'rw', blockHumanWhileAi: true }),
+      profiles: {},
+      dataDir: dir,
+      log: () => {},
+      historyStore: store,
+      autolog,
+    })
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+    }
+    const info = await registry.create({ transport: 'telnet', host: '10.0.0.5', port: 23 }, 'ai', 'owner-a')
+    assert.notEqual(info.id, 'st-1', 'the registry allocator must consult the autolog files')
+    await registry.dispose()
+  })
+})
+
+test('the legacy view opens the legacy file even when a new incarnation shares its id', async () => {
+  await withDir(async (dir) => {
+    await writeFile(join(dir, 'st-1.ndjson'), `${JSON.stringify({ t: T0, d: payload('LEGACY-ONLY\n') })}\n`, { mode: 0o600 })
+    await writeFile(
+      join(dir, 'index.json'),
+      `${JSON.stringify({
+        version: 1,
+        sessions: [{ id: 'st-1', title: 'legacy', transport: 'ssh', host: 'old', port: 22, username: 'u', createdAt: T0, lastTs: T0 }],
+      })}\n`,
+      { mode: 0o600 },
+    )
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: null, title: 'new ownerless', transport: 'ssh', host: 'new', port: 22, username: 'u', createdAt: T0 + 1,
+    })
+    store.appendChunk('st-1', 'ATTRIBUTED-ONLY\n', T0 + 2, null)
+    await store.closeSession('st-1', { owner: null, closedAt: T0 + 3, permission: { aiAccess: 'rw' } })
+    await settle(store)
+
+    const fresh = makeStore(dir)
+    await fresh.init()
+    const registry = makeRegistry(dir, fresh)
+    // The normal no-owner list must not show two ambiguous rows for one id;
+    // the legacy file is reachable through the explicit legacy view instead.
+    const normal = await registry.historySessions({ actor: 'human', owner: null })
+    assert.equal(normal.filter((entry) => entry.id === 'st-1').length, 1)
+    assert.ok(normal.find((entry) => entry.id === 'st-1')?.historyId)
+    const legacyHits = await registry.legacyHistoryQuery({ actor: 'human', sessionId: 'st-1', search: 'LEGACY-ONLY' })
+    assert.equal(legacyHits.matches.length, 1)
+    const attributedHits = await registry.legacyHistoryQuery({ actor: 'human', sessionId: 'st-1', search: 'ATTRIBUTED-ONLY' })
+    assert.equal(attributedHits.matches.length, 0, 'the legacy view must never read a new incarnation')
+    const exported = await registry.legacyHistoryExport({ actor: 'human', sessionId: 'st-1' })
+    const text = await readFile(exported.files[0].path, 'utf8')
+    assert.equal(text.includes('LEGACY-ONLY'), true)
+    assert.equal(text.includes('ATTRIBUTED-ONLY'), false)
     await registry.dispose()
   })
 })

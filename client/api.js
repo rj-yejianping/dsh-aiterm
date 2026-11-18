@@ -640,6 +640,39 @@ export function historyExport(params = {}) {
 }
 
 /**
+ * List pre-upgrade, ownerless history for the explicit human legacy view.
+ *
+ * The GUI always injects an owner, so these entries need a dedicated human-only
+ * path. No model tool exposes these methods; the Host rejects non-human actors.
+ *
+ * @param params - `{ limit?, since?, until? }`.
+ * @returns `{ sessions: CatalogEntry[] }`.
+ */
+export function legacyHistorySessions(params = {}) {
+  return rpc('history.legacy.sessions', params)
+}
+
+/**
+ * Query one catalogue legacy journal (human legacy view only).
+ *
+ * @param params - `{ sessionId, since?, until?, search?, context?, maxMatches?, maxBytes? }`.
+ * @returns the normalized history query result.
+ */
+export function legacyHistoryQuery(params = {}) {
+  return rpc('history.legacy.query', params)
+}
+
+/**
+ * Export one catalogue legacy journal (human legacy view only).
+ *
+ * @param params - `{ sessionId, since?, until? }`.
+ * @returns `{ dir, files }`.
+ */
+export function legacyHistoryExport(params = {}) {
+  return rpc('history.legacy.export', params)
+}
+
+/**
  * Read the auto-log (write-to-file) switch.
  *
  * @returns `{ enabled, dir }`.
@@ -666,6 +699,8 @@ export function historyQuery(params = {}) {
     const value = definedNumber(params[key])
     if (value !== undefined) payload[key] = value
   }
+  const historyId = definedString(params.historyId)
+  if (historyId !== undefined) payload.historyId = historyId
   const search = definedString(params.search)
   if (search !== undefined) payload.search = search
   return rpc('history.query', payload)
@@ -783,6 +818,7 @@ export function normalizeCatalogEntry(raw) {
     closedAt: asNumber(source.closedAt),
     bytes: asNumber(source.bytes) ?? 0,
     lastTs: asNumber(source.lastTs) ?? 0,
+    historyId: asString(source.historyId),
   }
 }
 

@@ -22,6 +22,9 @@ import {
   historyExport,
   historyQuery,
   historySessions,
+  legacyHistoryExport,
+  legacyHistoryQuery,
+  legacyHistorySessions,
   autologGet,
   autologSet,
   hostSearchValue,
@@ -86,6 +89,11 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const [listState, setListState] = useState('loading')
   const [listError, setListError] = useState(null)
   const [pickedId, setPickedId] = useState(null)
+  /** Exact incarnation address when several entries share one logical id. */
+  const [pickedHistoryId, setPickedHistoryId] = useState(null)
+  /** Explicit human-only view for pre-upgrade ownerless history. */
+  const [legacyMode, setLegacyMode] = useState(false)
+  const [legacyBusy, setLegacyBusy] = useState(false)
   const [since, setSince] = useState('')
   const [until, setUntil] = useState('')
   const [search, setSearch] = useState('')
@@ -93,7 +101,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const [result, setResult] = useState(null)
   const [pattern, setPattern] = useState(null)
   /** Auto-log (write every session to a file) state. */
-  const [autoLog, setAutoLog] = useState({ enabled: false, dir: '' })
+  const [autoLog, setAutoLog] = useState({ enabled: false, dir: '', needsReview: false })
   const [autoLogBusy, setAutoLogBusy] = useState(false)
   /**
    * False when the running Host predates the export / auto-log RPCs. The
@@ -132,6 +140,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         setListState(list.length > 0 ? 'ready' : 'empty')
         const preferred = list.find((entry) => entry.id === sessionId) || list[0]
         setPickedId(preferred ? preferred.id : null)
+        setPickedHistoryId(preferred ? (preferred.historyId || null) : null)
       } catch (error) {
         if (cancelled || !aliveRef.current) return
         setListError(errorMessage(error))
@@ -152,7 +161,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
    * @param id - catalog session id (defaults to the picked session).
    * @param filters - the filter fields captured at call time.
    */
-  async function runQuery(id = pickedId, filters = { since, until, search, context }) {
+  async function runQuery(id = pickedId, historyId = pickedHistoryId, filters = { since, until, search, context }) {
     if (!id) {
       setQueryState('empty')
       setQueryError(null)
@@ -180,14 +189,17 @@ export function HistoryPanel({ t, sessionId, onClose }) {
     setPattern(highlightPattern(filters.search))
 
     try {
-      const raw = await historyQuery({
+      const payload = {
         sessionId: id,
         since: sinceParsed.at,
         until: untilParsed.at,
         search: hostSearchValue(filters.search),
         context: Number(filters.context) || 0,
         maxMatches: 200,
-      })
+      }
+      const raw = legacyMode
+        ? await legacyHistoryQuery(payload)
+        : await historyQuery({ ...payload, historyId: historyId || undefined })
       if (requestRef.current !== token || !aliveRef.current) return
       const normalized = normalizeHistoryQuery(raw)
       setResult(normalized)
@@ -205,15 +217,18 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   // the user picks another one), honouring the filters typed so far.
   useEffect(() => {
     if (!pickedId) return
-    runQuery(pickedId, { since, until, search, context })
-  }, [pickedId])
+    runQuery(pickedId, pickedHistoryId, { since, until, search, context })
+  }, [pickedId, pickedHistoryId, legacyMode])
 
-  const selectSession = (id) => {
-    if (id === pickedId) {
-      runQuery(id)
+  const selectSession = (entry) => {
+    const id = entry && typeof entry === 'object' && entry.id ? entry.id : entry
+    const historyId = entry && typeof entry === 'object' && typeof entry.historyId === 'string' ? entry.historyId : null
+    if (id === pickedId && historyId === pickedHistoryId) {
+      runQuery(id, historyId)
       return
     }
     setPickedId(id)
+    setPickedHistoryId(historyId)
     setResult(null)
     setQueryState('idle')
     setQueryError(null)
@@ -254,6 +269,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         setAutoLog({
           enabled: state.enabled === true,
           dir: typeof state.dir === 'string' ? state.dir : '',
+          needsReview: state.needsReview === true,
         })
       })
       .catch((error) => {
@@ -279,8 +295,13 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       const params =
         scope === 'all'
           ? { all: true }
-          : { sessionId: pickedId || (sessionId || undefined) }
-      const result = await historyExport(params)
+          : {
+            sessionId: pickedId || (sessionId || undefined),
+            historyId: pickedHistoryId || undefined,
+          }
+      const result = legacyMode && scope !== 'all'
+        ? await legacyHistoryExport({ sessionId: params.sessionId })
+        : await historyExport(params)
       setExported(result || null)
       const files = result && Array.isArray(result.files) ? result.files : []
       notify(files.length > 0 ? fmt(t, 'historyExportDone', { count: files.length }) : t('historyExportEmpty'))
@@ -297,14 +318,16 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   }
 
   /** Flip the Host auto-log switch. @returns {Promise<void>} resolves when applied. */
-  const toggleAutoLog = async () => {
+  const toggleAutoLog = async (explicitNext) => {
     if (autoLogBusy) return
     setAutoLogBusy(true)
     try {
-      const next = await autologSet({ enabled: !autoLog.enabled })
+      const wanted = typeof explicitNext === 'boolean' ? explicitNext : !autoLog.enabled
+      const next = await autologSet({ enabled: wanted })
       setAutoLog({
         enabled: next && next.enabled === true,
         dir: next && typeof next.dir === 'string' ? next.dir : autoLog.dir,
+        needsReview: next && typeof next.needsReview === 'boolean' ? next.needsReview : false,
       })
       notify(next && next.enabled === true ? t('historyAutoLogOn') : t('historyAutoLogOff'))
     } catch (error) {
@@ -316,6 +339,83 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       }
     } finally {
       setAutoLogBusy(false)
+    }
+  }
+
+  /** Load the normal owner-scoped list (also used when leaving legacy mode). */
+  const loadNormal = async () => {
+    setListState('loading')
+    setListError(null)
+    try {
+      const raw = await historySessions({ limit: 50 })
+      const list = raw && Array.isArray(raw.sessions)
+        ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
+        : []
+      list.sort((left, right) => (right.lastTs || right.createdAt) - (left.lastTs || left.createdAt))
+      setSessions(list)
+      setListState(list.length > 0 ? 'ready' : 'empty')
+      const preferred = list.find((entry) => entry.id === sessionId) || list[0]
+      setPickedId(preferred ? preferred.id : null)
+      setPickedHistoryId(preferred ? (preferred.historyId || null) : null)
+      setResult(null)
+      setQueryState('idle')
+      setQueryError(null)
+      setManualText(null)
+    } catch (error) {
+      setListError(errorMessage(error))
+      setListState('error')
+    }
+  }
+
+  /** Open the explicit human-only legacy view. */
+  const enterLegacy = async () => {
+    if (legacyBusy) return
+    setLegacyBusy(true)
+    requestRef.current += 1
+    setLegacyMode(true)
+    // Drop the normal selection before switching sources so the query effect
+    // never runs the old owner-scoped id through the legacy RPC.
+    setPickedId(null)
+    setPickedHistoryId(null)
+    setListState('loading')
+    setListError(null)
+    setResult(null)
+    setQueryState('idle')
+    setQueryError(null)
+    setExported(null)
+    setExportError(null)
+    try {
+      const raw = await legacyHistorySessions({ limit: 50 })
+      const list = raw && Array.isArray(raw.sessions)
+        ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
+        : []
+      list.sort((left, right) => (right.lastTs || right.createdAt) - (left.lastTs || left.createdAt))
+      setSessions(list)
+      setListState(list.length > 0 ? 'ready' : 'empty')
+      setPickedId(list[0] ? list[0].id : null)
+      setPickedHistoryId(null)
+    } catch (error) {
+      setListError(errorMessage(error))
+      setListState('error')
+    } finally {
+      setLegacyBusy(false)
+    }
+  }
+
+  /** Leave legacy mode and restore the normal owner-scoped list. */
+  const leaveLegacy = async () => {
+    if (legacyBusy) return
+    setLegacyBusy(true)
+    requestRef.current += 1
+    setLegacyMode(false)
+    setPickedId(null)
+    setPickedHistoryId(null)
+    setExported(null)
+    setExportError(null)
+    try {
+      await loadNormal()
+    } finally {
+      setLegacyBusy(false)
     }
   }
 
@@ -348,8 +448,8 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       <Btn
         onClick={() => runExport('all')}
         busy={exportBusy === 'all'}
-        disabled={exportBusy !== '' || !logBackend}
-        title={logBackend ? t('historyExportAllHint') : t('historyExportNeedsRestart')}
+        disabled={exportBusy !== '' || !logBackend || legacyMode}
+        title={legacyMode ? t('historyLegacyHint') : (logBackend ? t('historyExportAllHint') : t('historyExportNeedsRestart'))}
       >
         {t('historyExportAll')}
       </Btn>
@@ -363,9 +463,21 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       backLabel={t('historyPanelClose')}
       footer={footer}
     >
-      <div style={S.sectionTitle}>{t('historySessionsTitle')}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={S.sectionTitle}>{t('historySessionsTitle')}</div>
+        <span style={S.controlSpacer} />
+        <Btn
+          onClick={legacyMode ? leaveLegacy : enterLegacy}
+          busy={legacyBusy}
+          title={t('historyLegacyHint')}
+        >
+          {legacyMode ? t('historyLegacyBack') : t('historyLegacyEntry')}
+        </Btn>
+      </div>
+      {legacyMode ? <div style={S.hint}>{t('historyLegacyHint')}</div> : null}
 
-      {listState === 'loading' ? <div style={S.auditEmpty}>{t('historyLoadingSessions')}</div> : null}
+      {legacyMode && listState === 'loading' ? <div style={S.auditEmpty}>{t('historyLegacyLoading')}</div> : null}
+      {listState === 'loading' && !legacyMode ? <div style={S.auditEmpty}>{t('historyLoadingSessions')}</div> : null}
       {listState === 'error' ? (
         <div style={S.formError} role="alert">{fmt(t, 'historySessionsFailed', { message: listError })}</div>
       ) : null}
@@ -374,18 +486,18 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       {sessions.length > 0 ? (
         <div style={S.listBox} role="listbox" aria-label={t('historySessionsTitle')}>
           {sessions.map((entry) => {
-            const active = entry.id === pickedId
+            const active = entry.id === pickedId && (entry.historyId || null) === pickedHistoryId
             const created = entry.createdAt > 0 ? formatStamp(entry.createdAt) : '—'
             const closed = entry.closedAt ? formatStamp(entry.closedAt) : t('historyOngoing')
             return (
               <button
-                key={entry.id}
+                key={entry.historyId ? `h:${entry.historyId}` : `l:${entry.id}:${entry.createdAt}`}
                 type="button"
                 role="option"
                 aria-selected={active}
                 title={`${entry.title} · ${entry.host || entry.transport}`}
                 style={{ ...S.listRow, ...(active ? S.listRowActive : null) }}
-                onClick={() => selectSession(entry.id)}
+                onClick={() => selectSession(entry)}
               >
                 <span style={S.listRowTitle}>{entry.title}</span>
                 <span style={S.listRowMeta}>
@@ -520,6 +632,18 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       <span style={S.hint}>
         {autoLog.enabled ? fmt(t, 'historyAutoLogWhere', { dir: autoLog.dir }) : t('historyAutoLogOffHint')}
       </span>
+      {autoLog.needsReview ? (
+        <div style={S.hint} role="status">
+          {t('historyAutoLogLegacyReview')}
+        </div>
+      ) : null}
+      {autoLog.needsReview ? (
+        <div style={S.actionRow}>
+          <Btn onClick={() => toggleAutoLog(false)} disabled={autoLogBusy || !logBackend}>
+            {t('historyAutoLogLegacyKeepOff')}
+          </Btn>
+        </div>
+      ) : null}
 
       {exportError ? (
         <div style={S.formError} role="alert">

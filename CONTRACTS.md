@@ -393,19 +393,31 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-> **v7 安全变更（0.5.3）**：会话 id（`st-N`）在插件重载后仍会从头计数，因此日志文件名不再
-> 只由会话 id 决定。每次 `openSession()` 都用 `open(file, 'wx')` **原子独占**创建新的
-> incarnation 文件，绝不重新打开/追加旧文件；owner 与关闭权限随文件私有保存，不依赖可被
-> 其他宿主实例覆盖的 `index.json`。升级前没有归属元数据的旧文件原样保留、对 AI fail closed。
+> **v8 安全变更（0.5.4）**：
+> 1. 会话 id（`st-N`）不再每次启动从 1 开始。历史目录的 `.ids/st-N` 用 `open(..., 'wx')`
+>    原子预留，跨重启、跨并发宿主续号；分配前还会跳过已有 journal 或已有 `<id>.log` 的 id。
+> 2. 每次 `openSession()` 仍用 `open(..., 'wx')` 独占创建新的 incarnation journal
+>    `<sessionId>~<uuid>.ndjson`，绝不追加旧文件。owner 与关闭权限随文件私有保存，不依赖
+>    `index.json`。
+> 3. 每个 incarnation 有独立 `historyId`（journal 文件名去掉 `.ndjson`）。列表返回**所有**
+>    incarnation；只传 `sessionId` 的旧调用者取最新（兼容），新调用者回传 `historyId` 精确
+>    寻址。绝不把不同 incarnation 的 owner/权限合并。
+> 4. `closeSession()` 只写回本进程实际打开的那个 incarnation（state 或显式 `historyId`）；
+>    reservation 失败时没有 state 就**不做任何回退**，不会给别的 crash journal 补权限。
+> 5. 旧格式文件原样保留、不删除、不改写；对 AI fail closed。正常 owner-bound 面板通过
+>    独立的**人工专用** `history.legacy.*` 入口访问，AI 工具不暴露。
 
 - 新格式：`<sessionId>~<uuid>.ndjson`
   - 第一行：`{"_aiterm":"journal","version":1,"id","owner","title","transport","host","port","username","createdAt"}`；`owner` 为 DSH 会话 id，或显式 `null`（无归属桶）。
   - 数据行：`{"t":<epoch ms>,"d":"<base64 UTF-8>"}`。
   - `closeSession()` 追加：`{"_aiterm":"close","version":1,"closedAt","bytes","lastTs","aiAccess"?}`；`aiAccess` 缺失表示关闭权限未知（AI fail closed）。
   - 文件头缺失/损坏 → unattributed：不列出、AI 不可读；文件不动。
+- 会话 id 预留：`<dir>/.ids/st-N`（0600，空/小 JSON 文件）。`allocateSessionId()` 先扫描最
+  大已用号，再用 `wx` 原子创建候选；`EEXIST` 就重试下一个。已有 legacy/new journal 或旧
+  `<id>.log` 的 id 不会分配。reservation 永久保留（很小），不参与 retention。
 - 旧格式（迁移前）：`<sessionId>.ndjson`（无文件头），仅从 `index.json` 取得公开目录信息；永不改写、永不被保留策略删除。
 - `index.json`：`{ "version": 1, "sessions": [CatalogEntry] }`，**只读旧数据**；新日志通过扫描文件头恢复。索引中的 `owner` 等字段不可信、不参与鉴权。
-- `CatalogEntry`：`{ id, title, transport, host, port, username, createdAt, closedAt?, bytes, lastTs }`；私有字段 `owner`、`aiAccess`、journal path 永不出现在工具/浏览器载荷。
+- `CatalogEntry`：`{ id, title, transport, host, port, username, createdAt, closedAt?, bytes, lastTs, historyId? }`；私有字段 `owner`、`aiAccess`、journal path 永不出现在工具/浏览器载荷。`historyId` 是公开的 incarnation 地址（不含 owner/权限）。
 
 ```js
 export class HistoryStore {
@@ -418,17 +430,21 @@ export class HistoryStore {
     log?: (level: string, message: string) => void,
   })
   async init(): Promise<void>
-  async openSession(meta: { id, owner, title, transport, host, port, username, createdAt }): Promise<boolean>
+  async allocateSessionId(options?): Promise<string | undefined>   // 唯一 st-N
+  async openSession(meta: { id, owner, title, transport, host, port, username, createdAt }): Promise<{ historyId, journal, fileBytes } | false>
   appendChunk(sessionId: string, text: string, at?: number, owner?: string | null): void
   async flush(sessionId?: string): Promise<void>
   async whenIdle(): Promise<void>
-  async closeSession(sessionId: string, info?: { closedAt?: number, permission?: { aiAccess?: string }, owner?: string | null }): Promise<void>
-  async listRecordings(query?): Promise<Recording[]>      // 私有 owner/aiAccess/journal 字段
+  async closeSession(sessionId: string, info?: { closedAt?, permission?: { aiAccess? }, owner?, historyId? }): Promise<void>
+  async listRecordings(query?): Promise<Recording[]>      // 私有 owner/aiAccess/journal + historyId
   async listLegacySessions(query?): Promise<CatalogEntry[]>
-  async resolveForRead(sessionId, owner, actor): Promise<{ kind: 'attributed', recording } | { kind: 'legacy', entry } | undefined>
+  async legacyEntry(sessionId): Promise<CatalogEntry | undefined>
+  async resolveForRead(sessionId, owner, actor, historyId?): Promise<{ kind: 'attributed', recording } | { kind: 'legacy', entry } | undefined>
+  async resolveByHistoryId(historyId, owner, actor): Promise<{ kind: 'attributed', recording } | undefined>
   canAiRead(recording): boolean                            // 仅关闭权限为 ro/rw 才为 true
-  journalForSync(sessionId, { owner, actor }): string | undefined
-  activeJournal(sessionId): string | undefined
+  journalForSync(sessionId, { owner, actor, historyId? }): string | undefined
+  activeJournal(sessionId, owner, historyId?): string | undefined
+  activeHandle(sessionId, owner, historyId?): { historyId, journal } | undefined
   async queryRecording(recording, query): Promise<QueryResult>
   async queryLegacy(entry, query): Promise<QueryResult>
   async query(query): Promise<QueryResult>                 // 便捷封装；无法判定时返回空
@@ -439,10 +455,19 @@ export class HistoryStore {
 
 规则：
 - `appendChunk` 只写内存缓冲；`flushIntervalMs` 到点或缓冲超过 64 KiB 时追加写文件（`appendFile`）。只写自己的 incarnation。
-- 任何磁盘错误只记 warn，绝不影响终端会话；关闭元数据写失败时进程内仍按已知权限处理，重启后未知权限 → AI fail closed。
+- 任何磁盘错误只记 warn，绝不影响终端会话。**append 失败时批次放回 pending**，close 只有在
+  pending 清空后才删除 writer 并追加关闭元数据；否则保留 state 供 `flush()`/`dispose()` 重试，
+  且关闭权限保持未知（AI fail closed）。
 - 单文件超过 `maxBytesPerSession` 时截断为尾部内容，**必须保留第一行文件头**；文件头无法确认时放弃截断（fail closed）。
-- 读取/导出先按 owner 匹配文件头；AI 还要求关闭权限为 `ro`/`rw`。legacy 只允许显式 `actor:'human', owner:null` 的历史桶读取，且必须能在 `index.json` 中存在（孤儿文件不暴露）。
-- 多个 `HistoryStore` 并发/重载/旧实例延迟 flush 时，`wx` 预留与独立文件名保证不串写；`index.json` 的 last-writer-wins 不影响归属判定。
+- 任意 journal 缺文件头/关闭权限缺失 → AI fail closed。legacy 只允许显式 `actor:'human'` 的 `history.legacy.*`
+  读取，且必须能在 `index.json` 中存在（孤儿文件不暴露）；旧文件不改不删。
+- 未知 id 的查询最多每 `SCAN_COOLDOWN_MS`（1s）扫一次目录，避免被反复猜测 id 放大 I/O。
+- 搜索对 live 与 closed 一致地不区分大小写；导出对单文件有 64 MiB 上限（`HISTORY_TOO_LARGE`），
+  显式导出源文件消失返回 `SESSION_NOT_FOUND`，不再写空文件。
+- 多个 `HistoryStore` 并发/重载/旧实例延迟 flush 时，`wx` id/journal 预留与独立文件名保证不串写；
+  `index.json` 的 last-writer-wins 不影响归属判定。
+- 审计：live 会话的 history slice/export 会写入该会话的审计环；已关闭会话没有进程内审计归属，
+  目前不记录（如需持久审计需另行设计）。
 
 ## 11. 批量与脚本（`lib/host/batch.js`、`lib/host/scripts.js`）
 
@@ -521,7 +546,7 @@ export class ScriptStore {
 | `aiterm_screen` | `{ sessionId, changedOnly?, maxLines?, cursor? }` | 可见屏幕文本（去空行、可只回变化行），返回 `cursor`/`atPrompt`/`unchanged` |
 | `aiterm_screenshot` | `{ sessionId }` | **兼容别名**，载荷精简为 `{ text, cols, rows, cursor, atPrompt, session }`（不再重复 `screen`+`text`） |
 | `aiterm_wait` | `{ sessionId, until?, pattern?, idleMs?, timeoutMs?, cursor?, includeOutput? }` | `until`: `idle`(默认)/`pattern`/`exit` |
-| `aiterm_history` | `{ sessionId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit? }` | 省略 `sessionId` 时返回会话目录；否则返回匹配/片段 |
+| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`）；否则返回匹配/片段 |
 | `aiterm_batch` | `{ steps, targets?, stopOnError?, maxTotalMs?, parallel?, label? }` | §11.2 |
 | `aiterm_script_list` | `{}` | 列出脚本 |
 | `aiterm_script_run` | `{ name, params?, sessionId?, targets? }` | 执行脚本（等价 batch，label=`script:<name>`） |
@@ -544,9 +569,12 @@ export class ScriptStore {
 |---|---|---|
 | `read.delta` | `{ id, cursor?, maxBytes? }` | `{ text, cursor, newBytes, atPrompt }` |
 | `read.screen` | `{ id, changedOnly?, maxLines? }` | `{ text, changedLines, cursor, atPrompt, unchanged }` |
-| `history.sessions` | `{ limit?, since?, until?, owner? }` | `{ sessions: CatalogEntry[] }`（按 owner 过滤；无归属旧数据只对 `owner:null` 的人工视图可见） |
-| `history.query` | `{ sessionId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }`（已关闭会话同样按 owner + 关闭权限判定） |
-| `history.export` | `{ sessionId?, all?, since?, until?, owner? }` | `{ dir, files: [{ sessionId, path, bytes, lines }] }`（`all` 只覆盖本 owner 且 AI 可读的会话） |
+| `history.sessions` | `{ limit?, since?, until?, owner? }` | `{ sessions: CatalogEntry[] }`（按 owner 过滤；同一 id 的多个 incarnation 逐条返回，各带 `historyId`） |
+| `history.query` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, owner? }` | `{ sessions?: CatalogEntry[], matches?: Match[], truncated, scannedBytes }`（已关闭会话同样按 owner + 关闭权限判定；`historyId` 精确指定 incarnation） |
+| `history.export` | `{ sessionId?, historyId?, all?, since?, until?, owner? }` | `{ dir, files: [{ sessionId, path, bytes, lines }] }`（`all` 只覆盖本 owner 且 AI 可读的会话；显式源文件缺失 → `SESSION_NOT_FOUND`） |
+| `history.legacy.sessions` | `{ limit?, since?, until? }` | `{ sessions: CatalogEntry[] }`（**仅人工**；无归属旧数据） |
+| `history.legacy.query` | `{ sessionId, since?, until?, search?, context?, maxMatches?, maxBytes? }` | history.query 同形（**仅人工**，不改写旧文件） |
+| `history.legacy.export` | `{ sessionId, since?, until? }` | `{ dir, files }`（**仅人工**；旧文件不改不删） |
 | `scripts.list` | `{}` | `{ scripts: ScriptSummary[] }` |
 | `scripts.save` | `{ script }` | `{ script: ScriptSummary }`（human only） |
 | `scripts.delete` | `{ name }` | `{ ok: boolean }`（human only） |

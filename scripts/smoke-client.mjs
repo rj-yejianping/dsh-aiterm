@@ -2451,7 +2451,17 @@ await closePanelViaBar()
     ],
   }))
   scene.handlers.set('history.query', async () => ({ matches: [], scannedBytes: 0 }))
-  scene.handlers.set('autolog.get', async () => ({ enabled: false, dir: '/home/u/.dsh/aiterm/logs' }))
+  scene.handlers.set('history.legacy.sessions', async () => ({
+    sessions: [
+      { id: 'st-legacy', title: 'old-unowned', transport: 'ssh', host: 'old.example', port: 22, username: 'old', createdAt: now - 120_000, bytes: 100, lastTs: now - 100_000 },
+    ],
+  }))
+  scene.handlers.set('history.legacy.query', async () => ({ matches: [{ at: now, line: 'LEGACY-OUT', before: [], after: [] }], scannedBytes: 50, truncated: false }))
+  scene.handlers.set('history.legacy.export', async (params) => ({
+    dir: '/home/u/.dsh/aiterm/exports',
+    files: [{ sessionId: params.sessionId, path: '/home/u/.dsh/aiterm/exports/st-legacy-old-20261023.log', bytes: 64, lines: 2 }],
+  }))
+  scene.handlers.set('autolog.get', async () => ({ enabled: false, dir: '/home/u/.dsh/aiterm/logs', needsReview: true }))
   scene.handlers.set('autolog.set', async (params) => ({ enabled: params.enabled === true, dir: '/home/u/.dsh/aiterm/logs' }))
   scene.handlers.set('history.export', async (params) => ({
     dir: '/home/u/.dsh/aiterm/exports',
@@ -2500,6 +2510,47 @@ await closePanelViaBar()
     assert.ok(call, 'export-all must call history.export')
     assert.equal(call.params.all, true, 'export-all must pass all: true')
     assert.equal(call.params.owner, 'session-smoke', 'export-all must be scoped to the DSH session')
+  }
+
+  // Explicit human-only legacy view: owner-bound GUI still reaches it.
+  {
+    const mark = scene.rpcCalls.length
+    await clickNode(findButtonByText(dict('historyLegacyEntry')), 'open legacy history')
+    await settle('legacy history opened')
+    const listCall = scene.rpcCalls.slice(mark).find((entry) => entry.method === 'history.legacy.sessions')
+    assert.ok(listCall, 'the legacy button must call history.legacy.sessions')
+    assert.equal(listCall.params.owner, undefined, 'the legacy view is an explicit human path, not an owner-scoped call')
+    const queryCall = scene.rpcCalls.slice(mark).find((entry) => entry.method === 'history.legacy.query')
+    assert.ok(queryCall, 'selecting legacy history must call history.legacy.query')
+    assert.equal(queryCall.params.sessionId, 'st-legacy')
+    assert.ok(textOf(lastTree).includes(dict('historyLegacyHint').slice(0, 8)), 'the legacy view must explain its boundary')
+
+    const exportMark = scene.rpcCalls.length
+    await clickNode(findButtonByText(dict('historyExportOne')), 'export legacy session')
+    const exportCall = scene.rpcCalls.slice(exportMark).find((entry) => entry.method === 'history.legacy.export')
+    assert.ok(exportCall, 'exporting legacy history must use history.legacy.export')
+    assert.equal(exportCall.params.sessionId, 'st-legacy')
+
+    const backMark = scene.rpcCalls.length
+    await clickNode(findButtonByText(dict('historyLegacyBack')), 'leave legacy history')
+    await settle('legacy history closed')
+    assert.ok(
+      scene.rpcCalls.slice(backMark).some((entry) => entry.method === 'history.sessions'),
+      'leaving the legacy view must restore the normal owner-scoped list',
+    )
+  }
+
+  // A legacy enabled auto-log setting is paused pending an explicit human choice.
+  {
+    assert.ok(
+      textOf(lastTree).includes(dict('historyAutoLogLegacyReview').slice(0, 10)),
+      'the panel must explain the legacy auto-log review',
+    )
+    const mark = scene.rpcCalls.length
+    await clickNode(findButtonByText(dict('historyAutoLogLegacyKeepOff')), 'keep legacy auto-log off')
+    const call = scene.rpcCalls.slice(mark).find((entry) => entry.method === 'autolog.set')
+    assert.ok(call, 'the keep-off confirmation must call autolog.set')
+    assert.equal(call.params.enabled, false, 'keep-off must persist an explicit disabled state')
   }
 
   // Flip the auto-log switch on.
