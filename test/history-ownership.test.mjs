@@ -26,7 +26,7 @@ import { AutoLog } from '../lib/host/autolog.js'
 import { DEFAULT_CONFIG, resolveConfig } from '../lib/host/config.js'
 import { exportSessions } from '../lib/host/exporter.js'
 import { HistoryStore } from '../lib/host/history-store.js'
-import { createPermission } from '../lib/host/permission.js'
+import { createPermission, expireIfIdle } from '../lib/host/permission.js'
 import { SessionRegistry, ownerScopedRegistry } from '../lib/host/registry.js'
 import { registerRoutes } from '../lib/host/routes.js'
 import { registerTools } from '../lib/host/tools.js'
@@ -1844,6 +1844,7 @@ test('a historyId-only query resolves its incarnation and list truncation is exp
     const page = await registry.historyQuery({ owner: 'owner-a', actor: 'human', limit: 1 })
     assert.equal(page.sessions.length, 1)
     assert.equal(page.truncated, true)
+    assert.equal(page.total, 2)
     await registry.dispose()
   })
 })
@@ -2231,20 +2232,16 @@ test('AI profile connects cannot override the saved target with profile credenti
       log: () => {},
       autolog: noopAutolog(),
     })
-    for (const override of [
-      { transport: 'telnet' },
-      { host: 'evil.example' },
-      { port: 22 },
-      { username: 'evil' },
-      { authType: 'agent' },
-    ]) {
-      await assert.rejects(
-        () => registry.resolveTarget({ profileId: 'saved', ...override }, 'ai'),
-        (error) => {
-          assert.equal(error?.code, 'AI_PROFILE_TARGET_DENIED')
-          return true
-        },
-      )
+    for (const key of ['transport', 'host', 'port', 'username', 'authType']) {
+      for (const value of [null, '', false, 0, Number.NaN, {}, [], 'evil.example']) {
+        await assert.rejects(
+          () => registry.resolveTarget({ profileId: 'saved', [key]: value }, 'ai'),
+          (error) => {
+            assert.equal(error?.code, 'AI_PROFILE_TARGET_DENIED', `${key}=${String(value)} must be rejected`)
+            return true
+          },
+        )
+      }
     }
     assert.equal(secretsRead, 0, 'overrides must be rejected before reading profile secrets')
     const aiTarget = await registry.resolveTarget({ profileId: 'saved', title: 'ok' }, 'ai')
@@ -2401,6 +2398,16 @@ test('synthetic local ssh2 capture: AI profile connect uses only the saved targe
         },
       )
       assert.equal(attempts.length, 0, 'a rejected override must not touch the synthetic server')
+      for (const value of [null, '']) {
+        await assert.rejects(
+          () => registry.create({ profileId: 'saved', port: value }, 'ai', 'owner-a'),
+          (error) => {
+            assert.equal(error?.code, 'AI_PROFILE_TARGET_DENIED')
+            return true
+          },
+        )
+      }
+      assert.equal(attempts.length, 0, 'null/empty port must not fall back to the default port')
 
       const created = await registry.create({ profileId: 'saved' }, 'ai', 'owner-a')
       assert.equal(created.state, 'open')
@@ -2487,10 +2494,8 @@ test('owner-filtered paging exposes true totals and export aggregates the cap', 
     }
     const skippedResult = await exportSessions({ historyStore: many, dir: join(dir, 'many'), all: true })
     assert.equal(skippedResult.files.length, 0)
-    assert.equal(skippedResult.skipped.length, 101, '100 details plus one aggregate')
-    const aggregate = skippedResult.skipped[skippedResult.skipped.length - 1]
-    assert.equal(aggregate.code, 'SKIPPED_AGGREGATE')
-    assert.equal(aggregate.count, 50)
+    assert.equal(skippedResult.skipped.length, 100, 'details are capped at 100; no aggregate entries')
+    assert.equal(skippedResult.skippedTotal, 150, 'the exact total is preserved')
     await store.dispose()
   })
 })
@@ -2544,6 +2549,173 @@ test('closing an AI waiter after a permission change denies its pending output',
     assert.equal(result.matched, false)
     assert.equal(result.reason, 'permission_changed')
     assert.equal(String(result.text), '')
+    await registry.dispose()
+  })
+})
+
+test('AI reconnect only refreshes profile credentials while the saved target identity matches', async () => {
+  await withDir(async (dir) => {
+    let saved = {
+      id: 'p', name: 'p', transport: 'ssh', host: 'saved.example', port: 2222, username: 'saved-user', authType: 'password',
+      auth: { type: 'password', password: 'OLD-PASSWORD' },
+    }
+    const profiles = {
+      async get(id) { return id === 'p' ? { ...saved, auth: undefined } : undefined },
+      async secretsFor() { return { password: saved.auth.password } },
+      async connectionFor() { return { ...saved } },
+    }
+    const registry = new SessionRegistry({
+      config: resolveConfig({ ...DEFAULT_CONFIG, aiAccessDefault: 'rw', aiAutoLock: false }),
+      profiles,
+      dataDir: dir,
+      log: () => {},
+      autolog: noopAutolog(),
+    })
+    let connects = 0
+    registry.openConnection = async (session) => {
+      connects += 1
+      session.state = 'open'
+    }
+    const info = await registry.create({ profileId: 'p' }, 'ai', 'owner-a')
+    const session = registry.sessions.get(info.id)
+    assert.deepEqual(session.profileBinding, {
+      transport: 'ssh', host: 'saved.example', port: 2222, username: 'saved-user', authType: 'password',
+    })
+    session.state = 'disconnected'
+    session.connection = undefined
+
+    saved = { ...saved, host: 'changed.example', auth: { type: 'password', password: 'NEW-PASSWORD' } }
+    await rejectsWithCode(
+      () => registry.reconnect(info.id, {}, 'ai', 'owner-a'),
+      'PROFILE_TARGET_CHANGED',
+    )
+    assert.equal(connects, 1, 'no connection is attempted with new credentials to the old endpoint')
+
+    saved = {
+      id: 'p', name: 'p', transport: 'ssh', host: 'saved.example', port: 2222, username: 'saved-user', authType: 'password',
+      auth: { type: 'password', password: 'ROTATED-PASSWORD' },
+    }
+    const reconnected = await registry.reconnect(info.id, {}, 'ai', 'owner-a')
+    assert.equal(reconnected.state, 'open')
+    assert.equal(connects, 2)
+    assert.equal(registry.sessions.get(info.id).auth.password, 'ROTATED-PASSWORD')
+    await registry.dispose()
+  })
+})
+
+
+test('natural AI lock expiry does not invalidate an authorized rw wait', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store, { aiAutoLock: true, aiLockIdleMs: 60_000 })
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    const info = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-lock')
+    const record = registry.sessions.get(info.id)
+    await registry.write(info.id, 'start\n', 'ai', 'owner-lock')
+    assert.equal(record.permission.lockOwner, 'ai')
+    const wait = registry.waitFor(info.id, {
+      until: 'pattern', pattern: 'AFTER-EXPIRY', timeoutMs: 1000, actor: 'ai', owner: 'owner-lock',
+    })
+    record.permission.lockExpiresAt = Date.now() - 1
+    const expired = expireIfIdle(record.permission, Date.now(), registry.config)
+    assert.equal(expired, true)
+    assert.equal(record.permission.lockOwner, null)
+    registry.handleData(record, 'AFTER-EXPIRY\n')
+    const result = await wait
+    assert.equal(result.matched, true, 'a natural lock expiry is not a read-authorization revocation')
+    assert.equal(String(result.text).includes('AFTER-EXPIRY'), true)
+    await registry.dispose()
+  })
+})
+
+test('a reopen refuses to retire an incarnation with an unwritten close intent', async () => {
+  await withDir(async (dir) => {
+    class CloseFailOnce extends HistoryStore {
+      constructor(options) {
+        super(options)
+        this.fail = 10
+      }
+      async appendCloseLine(file, line) {
+        if (this.fail > 0) {
+          this.fail -= 1
+          throw new Error('simulated close metadata failure')
+        }
+        return super.appendCloseLine(file, line)
+      }
+    }
+    const store = new CloseFailOnce({ dir, flushIntervalMs: 60_000, log: () => {} })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'one', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'DATA\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    const previous = store.active.get('st-1')
+    assert.ok(previous?.pendingClose)
+    if (previous.timer !== undefined) {
+      clearTimeout(previous.timer)
+      previous.timer = undefined
+    }
+    const before = (await readdir(dir)).filter((name) => name.endsWith('.ndjson'))
+    const reopened = await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'two', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + 3,
+    })
+    assert.equal(reopened, false, 'a pending close intent must block retirement')
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith('.ndjson')), before)
+
+    store.fail = 0
+    await store.flush('st-1')
+    const reopenedAfterRecovery = await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'two', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + 4,
+    })
+    assert.ok(reopenedAfterRecovery && typeof reopenedAfterRecovery === 'object')
+    await store.dispose()
+  })
+})
+
+test('history pagination uses a snapshot and reports a stale offset instead of skipping', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    for (const [id, text] of [['st-1', 'ONE\n'], ['st-2', 'TWO\n']]) {
+      await store.openSession({
+        id, owner: 'owner-a', title: id, transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+      })
+      store.appendChunk(id, text, T0 + 1, 'owner-a')
+      await store.closeSession(id, { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    }
+    await settle(store)
+    const registry = makeRegistry(dir, store)
+    const first = await registry.historySessionsPage({ owner: 'owner-a', actor: 'human', limit: 1, offset: 0 })
+    assert.equal(first.sessions.length, 1)
+    assert.equal(first.total, 2)
+    assert.equal(first.truncated, true)
+    assert.ok(typeof first.snapshot === 'string' && first.snapshot.length > 0)
+    const second = await registry.historySessionsPage({
+      owner: 'owner-a', actor: 'human', limit: 1, offset: 1, snapshot: first.snapshot,
+    })
+    assert.equal(second.sessions.length, 1)
+    assert.equal(second.truncated, false)
+    assert.equal(second.stale, undefined)
+    assert.equal(second.snapshot, first.snapshot)
+
+    // A new recorded session changes activity/order; the old offset is invalid.
+    await store.openSession({
+      id: 'st-3', owner: 'owner-a', title: 'st-3', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + 5,
+    })
+    store.appendChunk('st-3', 'THREE\n', T0 + 6, 'owner-a')
+    await store.closeSession('st-3', { owner: 'owner-a', closedAt: T0 + 7, permission: { aiAccess: 'rw' } })
+    await settle(store)
+    const stale = await registry.historySessionsPage({
+      owner: 'owner-a', actor: 'human', limit: 1, offset: 1, snapshot: first.snapshot,
+    })
+    assert.equal(stale.stale, true)
+    assert.deepEqual(stale.sessions, [])
+    assert.equal(stale.truncated, true)
     await registry.dispose()
   })
 })

@@ -90,6 +90,10 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const [listError, setListError] = useState(null)
   const [listTruncated, setListTruncated] = useState(false)
   const [listTotal, setListTotal] = useState(0)
+  const [listSnapshot, setListSnapshot] = useState('')
+  const [listRawCount, setListRawCount] = useState(0)
+  const listEpochRef = useRef(0)
+  const legacyModeRef = useRef(false)
   const [loadMoreBusy, setLoadMoreBusy] = useState(false)
   const [pickedId, setPickedId] = useState(null)
   /** Exact incarnation address when several entries share one logical id. */
@@ -124,6 +128,7 @@ export function HistoryPanel({ t, sessionId, onClose }) {
   const bodyRef = useRef(null)
   const requestRef = useRef(0)
   const aliveRef = useRef(true)
+  legacyModeRef.current = legacyMode
 
   useEffect(() => {
     aliveRef.current = true
@@ -145,6 +150,9 @@ export function HistoryPanel({ t, sessionId, onClose }) {
         setListState(list.length > 0 ? 'ready' : 'empty')
         setListTruncated(raw?.truncated === true)
         setListTotal(typeof raw?.total === 'number' ? raw.total : list.length)
+        setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : '')
+        setListRawCount(list.length)
+        listEpochRef.current += 1
         const preferred = list.find((entry) => entry.id === sessionId) || list[0]
         setPickedId(preferred ? preferred.id : null)
         setPickedHistoryId(preferred ? (preferred.historyId || null) : null)
@@ -315,10 +323,11 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setExported(result || null)
       const files = result && Array.isArray(result.files) ? result.files : []
       const skipped = result && Array.isArray(result.skipped) ? result.skipped : []
+      const skippedTotal = result && Number.isInteger(result.skippedTotal) ? result.skippedTotal : skipped.length
       notify(
         files.length > 0
           ? fmt(t, 'historyExportDone', { count: files.length })
-          : (skipped.length > 0 ? fmt(t, 'historyExportSkippedTitle', { count: skipped.length }) : t('historyExportEmpty')),
+          : (skippedTotal > 0 ? fmt(t, 'historyExportSkippedTitle', { count: skippedTotal }) : t('historyExportEmpty')),
       )
     } catch (error) {
       if (error && error.code === 'UNKNOWN_METHOD') {
@@ -398,6 +407,9 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListState(list.length > 0 ? 'ready' : 'empty')
       setListTruncated(raw?.truncated === true)
       setListTotal(typeof raw?.total === 'number' ? raw.total : list.length)
+      setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : '')
+      setListRawCount(list.length)
+      listEpochRef.current += 1
       const preferred = list.find((entry) => entry.id === sessionId) || list[0]
       setPickedId(preferred ? preferred.id : null)
       setPickedHistoryId(preferred ? (preferred.historyId || null) : null)
@@ -438,6 +450,9 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       setListState(list.length > 0 ? 'ready' : 'empty')
       setListTruncated(raw?.truncated === true)
       setListTotal(typeof raw?.total === 'number' ? raw.total : list.length)
+      setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : '')
+      setListRawCount(list.length)
+      listEpochRef.current += 1
       setPickedId(list[0] ? list[0].id : null)
       setPickedHistoryId(null)
     } catch (error) {
@@ -465,15 +480,28 @@ export function HistoryPanel({ t, sessionId, onClose }) {
     }
   }
 
-  /** Fetch the next page for the current (normal or legacy) source. */
+  /** Fetch the next page for the current source, with snapshot/epoch guards. */
   const loadMore = async () => {
     if (loadMoreBusy) return
+    const modeAtStart = legacyMode
+    const epochAtStart = listEpochRef.current
+    const snapshotAtStart = listSnapshot
+    const offsetAtStart = listRawCount
     setLoadMoreBusy(true)
     try {
-      const offset = sessions.length
-      const raw = legacyMode
-        ? await legacyHistorySessions({ limit: 50, offset })
-        : await historySessions({ limit: 50, offset })
+      const raw = modeAtStart
+        ? await legacyHistorySessions({ limit: 50, offset: offsetAtStart, snapshot: snapshotAtStart })
+        : await historySessions({ limit: 50, offset: offsetAtStart, snapshot: snapshotAtStart })
+      if (!aliveRef.current || epochAtStart !== listEpochRef.current || modeAtStart !== legacyModeRef.current) return
+      if (raw?.stale === true) {
+        // The server's ordering/activity changed while paging. A stale offset
+        // could skip rows; reload from the first page instead of silently
+        // claiming the list is complete.
+        notify(t('historyStaleReload'))
+        if (modeAtStart) await enterLegacy()
+        else await loadNormal()
+        return
+      }
       const more = raw && Array.isArray(raw.sessions)
         ? raw.sessions.map(normalizeCatalogEntry).filter(Boolean)
         : []
@@ -486,7 +514,9 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       })
       setSessions([...sessions, ...appended])
       setListTruncated(raw?.truncated === true)
-      setListTotal(typeof raw?.total === 'number' ? raw.total : sessions.length + appended.length)
+      setListTotal(typeof raw?.total === 'number' ? raw.total : listTotal)
+      setListSnapshot(typeof raw?.snapshot === 'string' ? raw.snapshot : snapshotAtStart)
+      setListRawCount(offsetAtStart + more.length)
     } catch (error) {
       notify(fmt(t, 'historySessionsFailed', { message: errorMessage(error) }))
     } finally {
@@ -748,11 +778,11 @@ export function HistoryPanel({ t, sessionId, onClose }) {
       {exported ? (
         <div style={S.exportBox} role="status">
           <div style={S.hint}>{fmt(t, 'historyExportWhere', { dir: exported.dir || '' })}</div>
-          {(exported.skipped || []).length > 0 ? (
+          {((Number.isInteger(exported.skippedTotal) ? exported.skippedTotal : (exported.skipped || []).length) > 0) ? (
             <div style={S.hint}>
               {fmt(t, 'historyExportSkipped', {
-                count: exported.skipped.length,
-                sessions: exported.skipped.map((entry) => entry.sessionId).join(', '),
+                count: Number.isInteger(exported.skippedTotal) ? exported.skippedTotal : (exported.skipped || []).length,
+                sessions: (exported.skipped || []).map((entry) => entry.sessionId).join(', '),
               })}
             </div>
           ) : null}

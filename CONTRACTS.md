@@ -393,7 +393,7 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-> **v8 安全变更（0.5.7）**：
+> **v8 安全变更（0.5.8）**：
 > 1. 会话 id（`st-N`）不再每次启动从 1 开始。历史目录的 `.ids/st-N` 用 `open(..., 'wx')`
 >    原子预留，跨重启、跨并发宿主续号；分配前还会跳过已有 journal 或已有 `<id>.log` 的 id。
 > 2. 每次 `openSession()` 仍用 `open(..., 'wx')` 独占创建新的 incarnation journal
@@ -459,6 +459,7 @@ export class HistoryStore {
 - 任何磁盘错误只记 warn，绝不影响终端会话。**append 失败时批次放回 pending**，close 只有在
   pending 清空后才删除 writer 并追加关闭元数据；否则保留 state 供 `flush()`/`dispose()` 重试，
   且关闭权限保持未知（AI fail closed）。
+- same-id reopen 前会先 flush/检查旧 incarnation；pending 数据、corrupt 或未写入的 close intent 任一存在都会拒绝 retire，避免丢失 close 权限。
 - append 以 batch 为事务：每批先记录起始文件偏移，逐行 write/sync；失败时 truncate 回起始偏移再重试。rollback 失败 → `corrupt=true`，停止写入且不写 close 权限（fail closed，不误报 healthy）。
 - pending 有界：`maxPendingBytes` 默认 1 MiB/会话（1024..64 MiB）。超限时**从最旧未落盘记录开始丢弃**，
   单个超大 chunk 直接丢弃；`stats()` 暴露 `pendingBytes/droppedBytes/writeFailures/retryDelayMs/degraded`。
@@ -491,7 +492,7 @@ export class HistoryStore {
   `max(lastTs, closedAt, stat.mtime)` 判老；大尾行/最近写入不会因旧 `lastTs` 被误删。maxSessions
   裁剪使用同一 activity 排序，但仍按数量执行：总量超限时可能裁掉近期但排序靠后的日志。不可验证租约时
   不承诺多 Host retention 一致；unclosed 可能长期占用磁盘。
-- 等待读取：AI waiter 在创建时记录 `PermissionState.revision`。等待期间任何 aiAccess/lock 变化（含 human takeover、恢复权限）都会以 `permission_changed` 结束且返回空 text、不更新 cursor；pattern/idle/timeout/exit 都走同一检查。
+- 等待读取：AI waiter 记录独立的 `readRevision`。aiAccess 变化、human takeover（以及 release）会以 `permission_changed` 结束且返回空 text、不更新 cursor；AI lock 的自然 idle 过期不会误触发。pattern/idle/timeout/exit/close 都走同一检查。
 - 审计：write/deny **不记录任何输入原文**，只保留 action/source/code/byteLength 等元数据。
   旧内存审计可能含历史原文；`audit({actor:'ai'})` 在返回前把所有 `detail` 脱敏为
   `<action>:redacted`（human 视图保留原值）。live 会话的 history slice/export 写入会话审计环；
@@ -574,7 +575,7 @@ export class ScriptStore {
 | `aiterm_screen` | `{ sessionId, changedOnly?, maxLines?, cursor? }` | 可见屏幕文本（去空行、可只回变化行），返回 `cursor`/`atPrompt`/`unchanged` |
 | `aiterm_screenshot` | `{ sessionId }` | **兼容别名**，载荷精简为 `{ text, cols, rows, cursor, atPrompt, session }`（不再重复 `screen`+`text`） |
 | `aiterm_wait` | `{ sessionId, until?, pattern?, idleMs?, timeoutMs?, cursor?, includeOutput? }` | `until`: `idle`(默认)/`pattern`/`exit` |
-| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, offset? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`；`truncated/total` 与 offset 分页）；否则返回匹配/片段 |
+| `aiterm_history` | `{ sessionId?, historyId?, since?, until?, search?, context?, maxMatches?, maxBytes?, limit?, offset? }` | 省略 `sessionId` 时返回会话目录（每个 incarnation 逐条，带 `historyId`；`truncated/total` 与 offset 分页；schema 含 `total`）；否则返回匹配/片段 |
 | `aiterm_batch` | `{ steps, targets?, stopOnError?, maxTotalMs?, parallel?, label? }` | §11.2 |
 | `aiterm_script_list` | `{}` | 列出脚本 |
 | `aiterm_script_run` | `{ name, params?, sessionId?, targets? }` | 执行脚本（等价 batch，label=`script:<name>`） |
@@ -645,8 +646,10 @@ scriptsDir: scripts                           # <dataDir> 下脚本目录名
 # v3 增补：配置管理与脚本语言
 
 > **AI + profileId 目标约束（0.5.7）**：AI 调用带 `profileId` 的 connect 时必须只传
-> profileId（及 title/cols/rows）；`transport`/`host`/`port`/`username`/`authType` 任一覆盖都会在
-> 读取 profile 密钥之前以 `AI_PROFILE_TARGET_DENIED` 拒绝，避免保存的密码/私钥被发往 AI 指定的目标。
+> profileId（及 title/cols/rows）；`transport`/`host`/`port`/`username`/`authType` 任一字段**存在且
+> 非 undefined**（含 null/空串/false/0/NaN/对象）都会在读取 profile 密钥之前以
+> `AI_PROFILE_TARGET_DENIED` 拒绝；AI 解析只使用 saved 值，不依赖 schema。reconnect 仅在保存 profile 的
+> endpoint/auth 身份与 session 初始绑定完全一致时刷新 secret，否则 `PROFILE_TARGET_CHANGED` 并提示人工重开。
 > 人工在表单里覆盖地址仍沿用原有行为（保存密码复用于人工编辑的目标）。
 
 ## 13. 配置（profile）管理

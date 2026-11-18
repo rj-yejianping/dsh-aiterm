@@ -616,6 +616,8 @@ export function historySessions(options = {}) {
   if (until !== undefined) params.until = until
   const offset = definedNumber(options.offset)
   if (offset !== undefined) params.offset = offset
+  const snapshot = definedString(options.snapshot)
+  if (snapshot !== undefined) params.snapshot = snapshot
   return rpc('history.sessions', params)
 }
 

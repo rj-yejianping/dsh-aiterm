@@ -2445,11 +2445,19 @@ await closePanelViaBar()
   }
 
   // ── history panel: export (current / all) + auto-log switch ────────────
-  scene.handlers.set('history.sessions', async () => ({
-    sessions: [
-      { id: 'st-ssh', title: 'web-1', transport: 'ssh', host: '10.0.0.5', port: 22, username: 'root', createdAt: now - 60_000, bytes: 2048, lastTs: now },
-    ],
-  }))
+  scene.handlers.set('history.sessions', async (params) => {
+    if (params.offset === 1 && params.snapshot === 'snap-1') {
+      return { sessions: [], total: 2, truncated: true, stale: true, snapshot: 'snap-2' }
+    }
+    return {
+      sessions: [
+        { id: 'st-ssh', title: 'web-1', transport: 'ssh', host: '10.0.0.5', port: 22, username: 'root', createdAt: now - 60_000, bytes: 2048, lastTs: now },
+      ],
+      total: 2,
+      truncated: true,
+      snapshot: 'snap-1',
+    }
+  })
   scene.handlers.set('history.query', async () => ({ matches: [], scannedBytes: 0 }))
   scene.handlers.set('history.legacy.sessions', async () => ({
     sessions: [
@@ -2510,6 +2518,17 @@ await closePanelViaBar()
     assert.ok(call, 'export-all must call history.export')
     assert.equal(call.params.all, true, 'export-all must pass all: true')
     assert.equal(call.params.owner, 'session-smoke', 'export-all must be scoped to the DSH session')
+  }
+
+  // Paging with a stale snapshot must reload rather than silently skip rows.
+  {
+    const mark = scene.rpcCalls.length
+    await clickNode(findButtonByText(dict('historyLoadMore')), 'load more history')
+    await settle('history stale page handled')
+    const calls = scene.rpcCalls.slice(mark).filter((entry) => entry.method === 'history.sessions')
+    assert.ok(calls.some((entry) => entry.params.offset === 1 && entry.params.snapshot === 'snap-1'), 'load more must send the snapshot and raw offset')
+    assert.ok(calls.some((entry) => (entry.params.offset === undefined || entry.params.offset === 0)), 'a stale response must reload the first page')
+    assert.ok(textOf(lastTree).includes(dict('historyStaleReload').slice(0, 8)), 'the stale reload must be explained')
   }
 
   // Explicit human-only legacy view: owner-bound GUI still reaches it.

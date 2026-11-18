@@ -39,7 +39,7 @@ dsh plugin --profile web add dsh-aiterm
 
 ```bash
 npm install && npm run build   # 需要 esbuild / xterm 才能重建 lib/client.js
-npm pack                       # → dsh-aiterm-0.5.7.tgz
+npm pack                       # → dsh-aiterm-0.5.8.tgz
 # 然后 plugin_manager(action:"install_bundle", target:"<tgz 绝对路径>")
 ```
 
@@ -68,7 +68,7 @@ sed -i 's#^  ssh-telnet/#  aiterm/#' ~/.dsh/.credentials.yaml
 sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 ```
 
-然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.7`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
+然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.8`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
 
 升级后需要自己改的地方：
 
@@ -130,7 +130,8 @@ sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 | `aiterm_export` | 把**本对话所属**会话输出（含已关闭会话）导出为 Host 上的文本日志文件；只写会话拒绝导出；可用 `historyId` 导出重复 id 的指定 incarnation |
 | `aiterm_autolog` | 查询自动写日志文件状态；该开关是宿主级隐私设置，**仅限人工**在历史面板修改（默认关闭，开关持久化）。旧版遗留的 `enabled:true` 会先保持关闭并等待人工确认 |
 
-AI 不能提供密码或私钥：需要密码/私钥的连接必须使用保存的 profile，由 Host 侧解析。**带 `profileId` 时 AI 只能传 profileId（及 title/cols/rows）**；transport/host/port/username/authType 覆盖会被 403 `AI_PROFILE_TARGET_DENIED` 拒绝，且拒绝发生在读取 profile 密钥之前，防止保存的密码被发往 AI 指定的目标。人工在表单里的地址覆盖仍保持原有行为（保存密码复用于人工编辑的目标）。
+AI 不能提供密码或私钥：需要密码/私钥的连接必须使用保存的 profile，由 Host 侧解析。**带 `profileId` 时 AI 只能传 profileId（及 title/cols/rows）**；transport/host/port/username/authType 只要**字段存在且非 undefined**（含 null/空串/false/0/NaN/对象）就会被 403 `AI_PROFILE_TARGET_DENIED` 拒绝，且拒绝发生在读取 profile 密钥之前。AI 解析完全使用保存的 transport/host/port/username/authType，不依赖 schema 校验，防止保存的密码被发往 AI 指定的目标或默认端口。人工在表单里的地址覆盖仍保持原有行为（保存密码复用于人工编辑的目标）。
+- AI reconnect 只有在保存 profile 的 endpoint/auth 身份与 session 初始绑定完全一致时才取新 secret；profile 目标或认证方式被人工改动后，AI 会以 `PROFILE_TARGET_CHANGED` 拒绝并提示从面板重开，绝不把新凭据发往旧 endpoint。
 
 以上是 `toolDisclosure: full`（默认）下的完整工具面。`progressive` 会额外常驻一个发现入口
 `aiterm_discover`（它不属于上面任何业务分组，也不接触终端）。其余工具的名称、参数、执行体、
@@ -402,10 +403,10 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
   AI 仍可用 `aiterm_export` 导出**自己 owner 下、AI 可读**的历史（wo 会话拒绝）
 - **从旧版本升级时的安全迁移**：旧版允许 AI 开启自动日志，升级后若读到没有人工确认标记的
   `enabled:true`，*运行时*保持关闭；**原 `settings.json` 和目录不会被自动改写**。面板会显示旧路径，
-  并禁用一键开关；人工必须明确点「保持关闭」或「确认并继续使用该目录」后才会写入确认标记；Host 端要求 `confirmLegacy:true` 且目录等于旧路径，普通 enable 无法绕过；UI 在设置读取完成前/读取失败时禁用开关并显示错误。
+  并禁用一键开关；人工必须明确点「保持关闭」或「确认并继续使用该目录」后才会写入确认标记；Host 端要求 `confirmLegacy:true` 且目录等于旧路径（`LEGACY_AUTOLOG_CONFIRM_REQUIRED`/`LEGACY_AUTOLOG_DIR_MISMATCH`），普通 enable 无法绕过；UI 在设置读取完成前/读取失败时禁用开关并显示错误。
   若人工不操作，重启后仍保持关闭。这是有意的兼容性变化：升级后既有自动日志不会立即继续，需人工确认一次。
 
-### 0.5.7 升级/回滚与历史兼容
+### 0.5.8 升级/回滚与历史兼容
 
 - **升级**：不需要迁移命令，也不改写/删除现有历史或 `settings.json`。第一次启动会扫描历史头并在 `history/.ids/` 建 id reservation；旧文件保持原样。
 - **会话 id**：从 0.5.4 起跨重启续号，不再回到 `st-1`；如果历史目录被清空，续号信息也一起丢失。
@@ -551,9 +552,10 @@ print('hello from the remote host')
 - 单次导出默认总预算 512 MiB；超出会以 `EXPORT_BUDGET` 明确跳过，不会静默截断。历史列表超过 limit 时返回 `truncated/total`；导出超过 5000 incarnation 时以 `EXPORT_LIMIT` 跳过。
 - `query()` 只把尾部 `maxBytes` 读入内存；`truncateSession()` 仍需整文件读取后重写（非流式，文件受 `maxBytesPerSession` 约束）。
 - 导出流式读取以 stat 时的 `snapshotBytes` 为界；快照尾部若为未完成行则不会解析成记录；完全依赖底层文件在读取期间不被外部截断/替换。
+- reopen same-id 时若旧 incarnation 还有未写入的 close intent，会拒绝 retire/新建 journal，直到 close 成功或进程结束保持 fail-closed。
 - 历史 append 以 batch 为事务：partial write 失败会 truncate 回 batch 起点再重试；若 truncate 也失败，writer 标记 `corrupt`，停止写入、不写 close 权限并保持 AI fail-closed。
-- 列表 owner 过滤在下发 limit 之前完成，分页返回 `truncated/total`；导出严格最多 5000 个 incarnation，超出用 `omitted:{count,limit,reason}` 汇总，skipped 明细最多 100 条+聚合，避免无限数组。
-- AI 的 `aiterm_wait` 在等待期间遇到任何权限/控制权 revision 变化都会以 `permission_changed` 结束：不回 text、不消费 cursor；恢复权限也不会追溯授权该窗口。
+- 列表 owner 过滤在下发 limit 之前完成，分页返回 `truncated/total/snapshot` 并支持 offset；UI 用 raw offset 和 snapshot 翻页，服务端排序变化时返回 `stale` 并重载首页，不静默跳过。导出严格最多 5000 个 incarnation，超出用 `omitted:{count,limit,reason}` 汇总；skipped 明细最多 100 条，`skippedTotal` 给精确总数，不再用多个 aggregate 或数组长度冒充总数。
+- AI 的 `aiterm_wait` 使用独立的 readAuthorization revision：aiAccess 变化、human takeover 会以 `permission_changed` 结束且不回 text/不消费 cursor，恢复权限也不追溯授权；AI 自身 lock 的自然 idle 过期**不会**误触发。
 - `maxSessions` 与 retention 使用同一 `max(lastTs, closedAt, mtime)` 活跃度排序；按数量裁剪时仍可能删除“近期但总数超限”的旧日志。
 - **验证范围**：披露/权限测试跑在真实 DSH `ToolsService`、真实 `SessionRegistry` 和真实权限代码上，但模型侧使用 stub LLM、传输使用内存桩；**没有使用真实 provider/模型，没有测量 token 用量、缓存命中或成本，也没有连接真实 SSH 主机**。因此真实 provider/model/token/cache/cost 与真实 SSH 行为均未验证。
 - 提示符识别是正则启发式，非标准 shell 集成；可通过 `promptPattern` 按需调整。
