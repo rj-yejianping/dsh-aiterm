@@ -20,7 +20,7 @@ reads, searchable history, batch scripts and a full audit trail.
   - `读写(rw)`：两者都可。
 - **AI 操作时屏蔽人工写**：AI 一开始输入就持有「控制权」，人工键盘输入被拒绝并显示提示；AI 空闲超时自动释放，或人工点「接管」立即夺回控制。
 - **双向互斥**：人工「接管」后，AI 的写入被拒绝，直到人工「交还 AI」。
-- **审计**：每次读、写、拒绝、控制权变更都记录来源（human / ai），面板内可查，AI 也能用工具查。
+- **审计**：每次读、写、拒绝、控制权变更都记录来源（human / ai），面板内可查，AI 也能用工具查。**终端输入原文不写入审计**；旧内存审计在返回给 AI 前会把 `detail` 统一脱敏，只有人工面板保留完整视图。
 - **凭据隔离**：保存的密码/私钥存在 Host 侧（优先 DSH 加密凭据库），不会进入模型上下文、工具结果或日志。
 
 > 这是权限与协作层面的护栏，不是远程主机的安全沙箱。对敏感环境请给 AI 设 `只读`，或让 AI 仅通过保存的 profile 连接。
@@ -39,7 +39,7 @@ dsh plugin --profile web add dsh-aiterm
 
 ```bash
 npm install && npm run build   # 需要 esbuild / xterm 才能重建 lib/client.js
-npm pack                       # → dsh-aiterm-0.5.5.tgz
+npm pack                       # → dsh-aiterm-0.5.6.tgz
 # 然后 plugin_manager(action:"install_bundle", target:"<tgz 绝对路径>")
 ```
 
@@ -68,7 +68,7 @@ sed -i 's#^  ssh-telnet/#  aiterm/#' ~/.dsh/.credentials.yaml
 sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 ```
 
-然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.5`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
+然后卸载旧包、安装当前版本（`dsh-aiterm@0.5.6`）并重启 DSH Web，浏览器 `Ctrl+F5`。不要新旧并存——两者注册同名工具会冲突。
 
 升级后需要自己改的地方：
 
@@ -385,7 +385,8 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
 | 导出全部 | 本对话拥有、当前可读的每个 incarnation 各写一个文件（含已关闭的；AI 只写/未知权限的 incarnation 跳过） |
 
 - 输出目录：`~/.dsh/aiterm/exports/`，文件名 `<会话id>-<incarnation短码>-<标题>-<时间戳>-<随机短码>.log`（旧版/无 historyId 的文件不带 incarnation 短码；随机短码保证并发导出也不会互相覆盖）
-- 导出结果同时返回 `skipped`：源文件缺失/不可读的条目会明确列出（`code`/`message`），不会伪装成成功的空文件；显式导出单个会话时缺失源直接报错。
+- 导出结果同时返回 `skipped`：源文件缺失/不可读、权限不允许或超出单次预算的条目会明确列出（`code`/`message`），不会伪装成成功的空文件；显式导出单个会话时缺失源直接报错。
+- 导出是**快照式**的：先固定源文件当前字节边界，再在真正读取前复验 owner/权限；持续写入的 live 会话不会让导出挂起，权限撤销后产生的新输出不会进入快照。单次调用默认最多输出 512 MiB（`EXPORT_BUDGET` 跳过），已完成的文件仍是独立有效文件。
 - 内容：头注释（协议 / `user@host:port` / 标题 / 开始时间）+ 每行 `<ISO 时间戳> <输出行>`
 - 文件写在**宿主机**上（不是浏览器下载），用 DSH 的文件面板取走即可；导出结果面板会列出路径、大小、行数
 - 导出失败会显示原因；若提示「重启 DSH 后可用」，说明宿主代码还是旧代际
@@ -400,11 +401,11 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
   AI 工具 `aiterm_autolog` 只能查询状态，任何开启/关闭/改目录的尝试都会以 `HUMAN_ONLY` 拒绝。
   AI 仍可用 `aiterm_export` 导出**自己 owner 下、AI 可读**的历史（wo 会话拒绝）
 - **从旧版本升级时的安全迁移**：旧版允许 AI 开启自动日志，升级后若读到没有人工确认标记的
-  `enabled:true`，*运行时*保持关闭并显示人工确认提示；**原 `settings.json` 和目录不会被自动改写**。
-  人工在面板选择「继续启用」或「保持关闭」后才会写入确认标记。若人工不操作，重启后仍保持关闭。
-  这是有意的兼容性变化：升级后既有自动日志不会立即继续，需人工确认一次。
+  `enabled:true`，*运行时*保持关闭；**原 `settings.json` 和目录不会被自动改写**。面板会显示旧路径，
+  并禁用一键开关；人工必须明确点「保持关闭」或「确认并继续使用该目录」后才会写入确认标记。
+  若人工不操作，重启后仍保持关闭。这是有意的兼容性变化：升级后既有自动日志不会立即继续，需人工确认一次。
 
-### 0.5.5 升级/回滚与历史兼容
+### 0.5.6 升级/回滚与历史兼容
 
 - **升级**：不需要迁移命令，也不改写/删除现有历史或 `settings.json`。第一次启动会扫描历史头并在 `history/.ids/` 建 id reservation；旧文件保持原样。
 - **会话 id**：从 0.5.4 起跨重启续号，不再回到 `st-1`；如果历史目录被清空，续号信息也一起丢失。
@@ -531,7 +532,7 @@ print('hello from the remote host')
   （`/^[A-Za-z_][A-Za-z0-9_]*$/`），写入当时不报错，但会让凭据文档在**下次启动**时
   无法解析，导致 DSH 起不来（本项目曾因此事故）。`test/secrets.test.mjs` 会拦截这种回退。
 - RPC 与 SSE 路由经 `connection.admit()` 认证（可信来源 + 签名 Cookie），非授权请求返回 401/403。
-- 审计只记录输入预览（控制字符剔除、≤200 字符），不记录机密内容。
+- 审计**不记录任何终端输入原文**（write/deny 只保留 `action`/`code`/`byteLength` 等元数据）；旧内存审计在 AI 查询前统一脱敏。human 面板仍保留受信的完整视图。
 - 终端历史：`~/.dsh/aiterm/history/<sessionId>~<uuid>.ndjson`（0600）。每个文件第一行是私有归属元数据，关闭时追加私有 `aiAccess`；`index.json` 仅用于读取升级前的旧目录/旧日志，新日志通过扫描文件头恢复，不依赖共享索引（多个宿主实例并发时索引的最后写入者不会改变归属）。
 - 会话 id 预留：`~/.dsh/aiterm/history/.ids/st-N`（0600，空文件）。首次分配用 `wx` 原子创建，跨重启/跨进程保证 `st-N` 不再复用；这些 reservation 不会被保留策略删除。
 - 升级前的旧历史 `<sessionId>.ndjson` 原样保留；保留策略不会删除或改写它们，代码也不会把新会话追加进去。
@@ -542,9 +543,14 @@ print('hello from the remote host')
 - AI 截屏基于 headless 终端模拟，全屏 TUI 的鼠标/图片类内容无法表达。
 - Telnet 协议本身明文传输（建议只在可信网络使用）。
 - 浏览器端把 RPC 前缀硬编码为默认的 `/aiterm`；若改了 `routePath`，需要同步修改 `client/api.js` 并 `npm run build`。
-- 升级前的历史文件没有归属/关闭权限元数据：为了不伪造归属，它们对 AI 完全 fail closed；只有历史面板的 **[旧历史（无归属）]** 人工入口可以读取。旧文件保留、不会被自动删除（保留策略只清理新格式日志）。
+- 升级前的历史文件没有归属/关闭权限元数据：为了不伪造归属，它们对 AI 完全 fail closed；只有历史面板的 **[旧历史（无归属）]** 人工入口可以读取。旧文件保留、不会被自动删除（保留策略只清理带 close 元数据的新格式日志；无 close 的 journal 保守保留）。
 - 同一 `st-N` 若因旧数据/异常出现多个 incarnation，列表会列出全部并带独立 `historyId`；只传 `sessionId` 的旧调用者仍取最新一条（兼容），新调用者应回传 `historyId` 精确访问。不会把两条的权限/owner 合并。
 - 已关闭会话的历史读取/导出只在内存审计里记录**活跃**会话（关闭会话没有进程内审计归属）；如果完整审计是硬要求，需要另行设计持久审计。
+- 历史写入的 pending 缓冲默认每会话 1 MiB；在**持续磁盘写失败**时按策略丢弃最旧的未落盘数据（`droppedBytes/degraded` 可观察，日志 60s 节流）。这是有意的有界内存策略，**不是零丢失**。
+- 没有跨进程活动租约：prune **不删除无 close 元数据的 journal**（可能属于其他进程的 live writer 或 crash 数据），因此这类文件可能长期保留；带 close 元数据的才按 `max(lastTs, closedAt, mtime)` 计算。多 Host 的 retention 一致性无法承诺。
+- 单次导出默认总预算 512 MiB；超出会以 `EXPORT_BUDGET` 明确跳过，不会静默截断。历史列表超过 limit 时返回 `truncated/total`；导出超过 5000 incarnation 时以 `EXPORT_LIMIT` 跳过。
+- `query()` 只把尾部 `maxBytes` 读入内存；`truncateSession()` 仍需整文件读取后重写（非流式，文件受 `maxBytesPerSession` 约束）。
+- 导出流式读取以 stat 时的 `snapshotBytes` 为界；完全依赖于底层文件在读取期间不被外部截断/替换。
 - **验证范围**：披露/权限测试跑在真实 DSH `ToolsService`、真实 `SessionRegistry` 和真实权限代码上，但模型侧使用 stub LLM、传输使用内存桩；**没有使用真实 provider/模型，没有测量 token 用量、缓存命中或成本，也没有连接真实 SSH 主机**。因此真实 provider/model/token/cache/cost 与真实 SSH 行为均未验证。
 - 提示符识别是正则启发式，非标准 shell 集成；可通过 `promptPattern` 按需调整。
 - 面板视觉验证需要浏览器环境；本项目环境无浏览器控制能力，界面仅做了构建与注册级验证。

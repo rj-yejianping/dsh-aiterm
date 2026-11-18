@@ -2546,6 +2546,10 @@ await closePanelViaBar()
       textOf(lastTree).includes(dict('historyAutoLogLegacyReview').slice(0, 10)),
       'the panel must explain the legacy auto-log review',
     )
+    assert.ok(textOf(lastTree).includes('/home/u/.dsh/aiterm/logs'), 'the old autolog path must be shown before confirming')
+    assert.ok(textOf(lastTree).includes(dict('historyAutoLogLegacyEnable').slice(0, 6)), 'an explicit confirm action must be present')
+    const reviewBoxes = collect(lastTree, (node) => node.type === 'input' && node.props && node.props.type === 'checkbox')
+    assert.equal(reviewBoxes[reviewBoxes.length - 1].props.disabled, true, 'the one-click switch must stay disabled during review')
     const mark = scene.rpcCalls.length
     await clickNode(findButtonByText(dict('historyAutoLogLegacyKeepOff')), 'keep legacy auto-log off')
     const call = scene.rpcCalls.slice(mark).find((entry) => entry.method === 'autolog.set')

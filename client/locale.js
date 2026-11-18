@@ -155,6 +155,7 @@ export const zh = {
   historySessionsTitle: '历史会话',
   historyLoadingSessions: '正在读取历史会话…',
   historySessionsEmpty: '暂无历史会话',
+  historySessionsTruncated: '只显示前 {shown} 条（共 {total} 条）；请缩小时间范围。',
   historySessionsFailed: '读取历史会话失败：{message}',
   historyOngoing: '进行中',
   historySince: '起始时间',
@@ -198,6 +199,8 @@ export const zh = {
 
   historyAutoLogLegacyReview: '旧版本曾开启自动写日志。该开关会记录所有对话的终端输出，升级后默认保持关闭；原设置和目录未被修改。请人工确认：打开开关表示继续启用，点「保持关闭」则明确关闭。',
   historyAutoLogLegacyKeepOff: '保持关闭',
+  historyAutoLogLegacyPath: '旧设置目录：{dir}',
+  historyAutoLogLegacyEnable: '确认并继续使用该目录',
   historyAutoLogWhere: '正在写入 {dir}',
   historyAutoLogOn: '已开启自动写日志',
   historyAutoLogOff: '已关闭自动写日志',
@@ -568,6 +571,7 @@ export const en = {
   historySessionsTitle: 'History sessions',
   historyLoadingSessions: 'Loading history sessions…',
   historySessionsEmpty: 'No history sessions yet',
+  historySessionsTruncated: 'Showing {shown} of {total}; narrow the time window to see the rest.',
   historySessionsFailed: 'Could not load history sessions: {message}',
   historyOngoing: 'active',
   historySince: 'Since',
@@ -611,6 +615,8 @@ export const en = {
 
   historyAutoLogLegacyReview: 'An older version enabled automatic log files. This switch records every conversation\'s terminal output, so it stays off after upgrade until you confirm; the old setting and directory were not modified. Turn it on to keep using it, or choose Keep off to confirm it stays disabled.',
   historyAutoLogLegacyKeepOff: 'Keep off',
+  historyAutoLogLegacyPath: 'Old configured directory: {dir}',
+  historyAutoLogLegacyEnable: 'Confirm and keep using this directory',
   historyAutoLogWhere: 'Writing to {dir}',
   historyAutoLogOn: 'Auto-log enabled',
   historyAutoLogOff: 'Auto-log disabled',

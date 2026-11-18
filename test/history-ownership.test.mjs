@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdir, mkdtemp, readdir, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, rmdir, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -24,6 +24,7 @@ import { AutoLog } from '../lib/host/autolog.js'
 import { DEFAULT_CONFIG, resolveConfig } from '../lib/host/config.js'
 import { exportSessions } from '../lib/host/exporter.js'
 import { HistoryStore } from '../lib/host/history-store.js'
+import { createPermission } from '../lib/host/permission.js'
 import { SessionRegistry } from '../lib/host/registry.js'
 import { registerTools } from '../lib/host/tools.js'
 
@@ -1480,5 +1481,436 @@ test('export all does not report a readable live incarnation as a permission ski
     assert.equal(text.includes('CLOSED-LIVE'), true)
     assert.equal(text.includes('LIVE-DATA'), true)
     await registry.dispose()
+  })
+})
+
+
+/* ------------------------------------------------------------------ *
+ * 12. Audit redaction, partial writes, live snapshot, prune, budget.
+ * ------------------------------------------------------------------ */
+
+test('audit never stores input text and redacts old entries before returning to AI', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    const registry = makeRegistry(dir, store, { aiAccessDefault: 'wo' })
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    const info = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-a')
+    const session = registry.sessions.get(info.id)
+    const secret = 'SUDO-PASSWORD-hunter2'
+    await registry.write(info.id, `${secret}\n`, 'human', 'owner-a')
+    const humanAudit = registry.audit({ sessionId: info.id, owner: 'owner-a', actor: 'human' })
+    const aiAudit = registry.audit({ sessionId: info.id, owner: 'owner-a', actor: 'ai' })
+    assert.equal(humanAudit.some((entry) => String(entry.detail).includes(secret)), false, 'new write entries must not store input')
+    assert.equal(aiAudit.some((entry) => String(entry.detail).includes(secret)), false)
+
+    // Simulate a pre-fix in-memory entry that still contains raw input.
+    const legacyEntry = {
+      at: Date.now(), sessionId: info.id, title: session.title, source: 'human',
+      action: 'write', detail: 'OLD-SECRET-INPUT', byteLength: 15,
+    }
+    session.audit.push(legacyEntry)
+    registry.globalAudit.push(legacyEntry)
+    const redacted = registry.audit({ sessionId: info.id, owner: 'owner-a', actor: 'ai' })
+    assert.equal(redacted.some((entry) => String(entry.detail).includes('OLD-SECRET-INPUT')), false)
+    assert.ok(redacted.every((entry) => typeof entry.detail === 'string' && entry.detail.length > 0))
+    const humanOld = registry.audit({ sessionId: info.id, owner: 'owner-a', actor: 'human' })
+    assert.equal(humanOld.some((entry) => String(entry.detail).includes('OLD-SECRET-INPUT')), true, 'the human keeps the trusted view')
+
+    // The real AI tool must be redacted as well.
+    const definitions = new Map()
+    const ctx = {
+      tools: { register(definition) { definitions.set(definition.name, definition); return () => {} }, get() { return undefined } },
+      effect(run) { run(); return () => {} },
+      inject() {},
+      on() {},
+    }
+    registerTools(ctx, { config: resolveConfig({ ...DEFAULT_CONFIG, toolDisclosure: 'full' }), registry, scripts: undefined, profiles: {} })
+    const auditTool = definitions.get('aiterm_audit')
+    const toolResult = await auditTool.execute({ sessionId: info.id }, { agent: { id: 'owner-a' } })
+    assert.equal(String(toolResult.text).includes('OLD-SECRET-INPUT'), false)
+    assert.equal(String(toolResult.text).includes(secret), false)
+
+    await registry.close(info.id, 'test', 'human', 'owner-a')
+    await settle(store)
+    const globalAi = registry.audit({ owner: 'owner-a', actor: 'ai' })
+    assert.equal(globalAi.some((entry) => String(entry.detail).includes('OLD-SECRET-INPUT')), false)
+    assert.equal(globalAi.some((entry) => String(entry.detail).includes(secret)), false)
+    await registry.dispose()
+  })
+})
+
+test('export handles partial writes and never renames a failed temp file', async () => {
+  await withDir(async (dir) => {
+    const history = join(dir, 'history')
+    const out = join(dir, 'exports')
+    await mkdir(history, { recursive: true })
+    const journal = join(history, 'st-1.ndjson')
+    await writeFile(journal, `${JSON.stringify({ t: T0, d: payload('PARTIAL-WRITE\n') })}\n`, { mode: 0o600 })
+    const fakeStore = {
+      fileFor: () => journal,
+      flush: async () => {},
+      listSessions: async () => [{ id: 'st-1', title: 't', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 }],
+    }
+    const partial = async (handle, text) => {
+      const buffer = Buffer.from(text, 'utf8')
+      let offset = 0
+      while (offset < buffer.length) {
+        const { bytesWritten } = await handle.write(buffer, offset, 1)
+        if (bytesWritten !== 1) throw new Error('short write')
+        offset += 1
+      }
+    }
+    const result = await exportSessions({ historyStore: fakeStore, dir: out, sessionId: 'st-1', writeAll: partial })
+    const info = await stat(result.files[0].path)
+    const text = await readFile(result.files[0].path, 'utf8')
+    assert.equal(result.files[0].bytes, info.size)
+    assert.equal(text.includes('PARTIAL-WRITE'), true)
+    assert.equal((text.match(/\n/g) || []).length, result.files[0].lines)
+
+    const failedOut = join(dir, 'failed-exports')
+    const failing = async (handle, text) => {
+      await handle.write(Buffer.from(text.slice(0, 1), 'utf8'))
+      throw new Error('simulated disk full')
+    }
+    await assert.rejects(
+      () => exportSessions({ historyStore: fakeStore, dir: failedOut, sessionId: 'st-1', writeAll: failing }),
+      (error) => {
+        assert.equal(error?.code, 'HISTORY_READ_FAILED')
+        assert.equal(String(error.message).includes(history), false, 'the private journal path must not leak')
+        return true
+      },
+    )
+    assert.deepEqual(await readdir(failedOut), [], 'a failed stream must not leave a log or temp file')
+  })
+})
+
+test('live export freezes the source boundary and never streams to EOF', async () => {
+  await withDir(async (dir) => {
+    const history = join(dir, 'history')
+    await mkdir(history, { recursive: true })
+    const journal = join(history, 'st-1~live.ndjson')
+    await writeFile(journal, `${JSON.stringify({ _aiterm: 'journal', version: 1, id: 'st-1', owner: 'owner-a', title: 'live', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 })}\n${JSON.stringify({ t: T0, d: payload('PRE-SNAPSHOT\n') })}\n`, { mode: 0o600 })
+    let release
+    let reached
+    const gate = new Promise((resolve) => { release = resolve })
+    const reachedP = new Promise((resolve) => { reached = resolve })
+    const fakeStore = {
+      fileFor: () => journal,
+      flush: async () => {},
+      listSessions: async () => [{ id: 'st-1', historyId: 'st-1~live', title: 'live', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 }],
+      beforeRead: async () => {
+        reached()
+        await gate
+      },
+    }
+    const outcome = exportSessions({ historyStore: fakeStore, sessions: [], dir: join(dir, 'exports'), all: true })
+    await reachedP
+    await appendFile(journal, `${JSON.stringify({ t: T0 + 1, d: payload('AFTER-SNAPSHOT\n') })}\n`)
+    release()
+    const result = await outcome
+    assert.equal(result.files.length, 1)
+    const text = await readFile(result.files[0].path, 'utf8')
+    assert.equal(text.includes('PRE-SNAPSHOT'), true)
+    assert.equal(text.includes('AFTER-SNAPSHOT'), false, 'output after the frozen boundary must not be included')
+
+    // A writer that keeps growing the file must not keep the exporter at EOF.
+    const floodJournal = join(history, 'st-2~live.ndjson')
+    await writeFile(floodJournal, `${JSON.stringify({ _aiterm: 'journal', version: 1, id: 'st-2', owner: 'owner-a', title: 'flood', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 })}\n${JSON.stringify({ t: T0, d: payload('FIRST\n') })}\n`, { mode: 0o600 })
+    let flooding = true
+    const flood = (async () => {
+      let index = 0
+      while (flooding) {
+        await appendFile(floodJournal, `${JSON.stringify({ t: T0 + index, d: payload(`FLOOD-${index}\n`) })}\n`)
+        index += 1
+        if (index % 10 === 0) await new Promise((resolve) => setImmediate(resolve))
+      }
+    })().catch(() => {})
+    const floodStore = {
+      fileFor: () => floodJournal,
+      flush: async () => {},
+      listSessions: async () => [{ id: 'st-2', historyId: 'st-2~live', title: 'flood', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 }],
+    }
+    const floodResult = await Promise.race([
+      exportSessions({ historyStore: floodStore, sessions: [], dir: join(dir, 'flood-exports'), all: true }),
+      new Promise((resolve, reject) => setTimeout(() => reject(new Error('export hung on a growing live journal')), 2500)),
+    ])
+    flooding = false
+    await flood
+    assert.equal(floodResult.files.length, 1)
+    await rm(join(dir, 'flood-exports'), { recursive: true, force: true })
+  })
+})
+
+test('revoking AI read during export fails closed, and closing during export uses the durable journal', async () => {
+  await withDir(async (dir) => {
+    let releaseFlush
+    let reachedFlush
+    let exportGate = false
+    class GateStore extends HistoryStore {
+      async flush(sessionId) {
+        if (exportGate && sessionId === undefined) {
+          exportGate = false
+          reachedFlush()
+          await new Promise((resolve) => { releaseFlush = resolve })
+        }
+        return super.flush(sessionId)
+      }
+    }
+    const store = new GateStore({ dir, retentionMs: 3_600_000, maxBytesPerSession: 1_000_000, maxSessions: 100, flushIntervalMs: 10, log: () => {} })
+    await store.init()
+    const registry = makeRegistry(dir, store)
+    registry.openConnection = async (session) => {
+      session.state = 'open'
+      session.connection = { write() {}, resize() {}, close: async () => {} }
+    }
+    const info = await registry.create({ transport: 'telnet', host: '127.0.0.1', port: 23 }, 'human', 'owner-a')
+    const record = registry.sessions.get(info.id)
+    registry.handleData(record, 'PRE-REVOKE\n')
+    await store.flush(info.id)
+
+    exportGate = true
+    const reached = new Promise((resolve) => { reachedFlush = resolve })
+    const exportPromise = registry.exportHistory({ all: true, owner: 'owner-a', actor: 'ai' })
+    await reached
+    registry.setAiAccess(info.id, 'wo', 'human', 'owner-a')
+    registry.handleData(record, 'POST-REVOKE-SECRET\n')
+    await store.flush(info.id)
+    releaseFlush()
+    const result = await exportPromise
+    assert.equal(result.files.length, 0, 'revoked live read must not produce an export file')
+    assert.ok(result.skipped.length > 0)
+    assert.equal(result.skipped.some((entry) => String(entry.message).includes('POST-REVOKE-SECRET')), false)
+
+    // Restore read, gate again, and close the session while the export runs.
+    registry.setAiAccess(info.id, 'rw', 'human', 'owner-a')
+    exportGate = true
+    const closeReached = new Promise((resolve) => { reachedFlush = resolve })
+    const closeExport = registry.exportHistory({ sessionId: info.id, owner: 'owner-a', actor: 'ai' })
+    await closeReached
+    await registry.close(info.id, 'race close', 'human', 'owner-a')
+    await settle(store)
+    releaseFlush()
+    const closedResult = await closeExport
+    assert.equal(closedResult.files.length, 1, 'the durable incarnation must remain exportable after close')
+    const closedText = await readFile(closedResult.files[0].path, 'utf8')
+    assert.equal(closedText.includes('PRE-REVOKE'), true)
+    await registry.dispose()
+  })
+})
+
+test('prune preserves unclosed journals from another store and uses mtime for closed ones', async () => {
+  await withDir(async (dir) => {
+    const oldAt = Date.now() - 3 * 24 * 60 * 60 * 1000
+    const first = makeStore(dir, { retentionMs: 3_600_000 })
+    await first.init()
+    await first.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'live', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: oldAt,
+    })
+    first.appendChunk('st-1', 'FIRST-LIVE\n', oldAt + 1, 'owner-a')
+    await first.flush('st-1')
+    const liveJournal = first.journalForSync('st-1', { owner: 'owner-a', actor: 'human' })
+    assert.ok(liveJournal)
+
+    const second = makeStore(dir, { retentionMs: 3_600_000 })
+    await second.init()
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.ok(await stat(liveJournal).then(() => true, () => false), 'another store must not prune an unclosed live journal')
+    first.appendChunk('st-1', 'SECOND-LIVE\n', Date.now(), 'owner-a')
+    await first.flush('st-1')
+    const liveText = decodedOutput(await readFile(liveJournal, 'utf8'))
+    assert.equal(liveText.includes('FIRST-LIVE'), true)
+    assert.equal(liveText.includes('SECOND-LIVE'), true)
+
+    // A closed journal with a huge tail written recently but an old lastTs must
+    // survive because its filesystem mtime is recent.
+    await first.openSession({
+      id: 'st-2', owner: 'owner-a', title: 'big-tail', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: oldAt,
+    })
+    first.appendChunk('st-2', `${'X'.repeat(100 * 1024)}\n`, oldAt + 2, 'owner-a')
+    await first.flush('st-2')
+    const bigJournal = first.journalForSync('st-2', { owner: 'owner-a', actor: 'human' })
+    await first.closeSession('st-2', { owner: 'owner-a', closedAt: oldAt + 3, permission: { aiAccess: 'rw' } })
+    await settle(first)
+    const third = makeStore(dir, { retentionMs: 3_600_000 })
+    await third.init()
+    assert.ok(await stat(bigJournal).then(() => true, () => false), 'recent mtime must protect the large tail')
+
+    // With both timestamps old, the closed journal is pruned.
+    await utimes(bigJournal, new Date(oldAt), new Date(oldAt))
+    const fourth = makeStore(dir, { retentionMs: 3_600_000 })
+    await fourth.init()
+    assert.equal(await stat(bigJournal).then(() => true, () => false), false, 'a genuinely old closed journal is pruned')
+    await first.dispose()
+    await second.dispose()
+    await third.dispose()
+    await fourth.dispose()
+  })
+})
+
+test('export enforces a per-call output budget and reports the skipped file', async () => {
+  await withDir(async (dir) => {
+    const history = join(dir, 'history')
+    await mkdir(history, { recursive: true })
+    const first = join(history, 'a.ndjson')
+    const second = join(history, 'b.ndjson')
+    const record = (text) => `${JSON.stringify({ t: T0, d: payload(text) })}\n`
+    await writeFile(first, record(`${'A'.repeat(400)}\n`), { mode: 0o600 })
+    await writeFile(second, record(`${'B'.repeat(400)}\n`), { mode: 0o600 })
+    const store = {
+      fileFor: (id) => (id === 'st-1' ? first : id === 'st-2' ? second : undefined),
+      flush: async () => {},
+      listSessions: async () => [
+        { id: 'st-1', title: 'a', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 },
+        { id: 'st-2', title: 'b', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 },
+      ],
+    }
+    const result = await exportSessions({ historyStore: store, dir: join(dir, 'budget'), all: true, maxTotalBytes: 900 })
+    assert.equal(result.files.length, 1)
+    assert.equal(result.skipped.length, 1)
+    assert.equal(result.skipped[0].code, 'EXPORT_BUDGET')
+    assert.equal(result.skipped[0].sessionId, 'st-2')
+    await assert.rejects(
+      () => exportSessions({ historyStore: store, dir: join(dir, 'budget-explicit'), sessionId: 'st-2', maxTotalBytes: 100 }),
+      (error) => {
+        assert.equal(error?.code, 'EXPORT_BUDGET')
+        return true
+      },
+    )
+    assert.deepEqual(await readdir(join(dir, 'budget-explicit')), [])
+  })
+})
+
+test('allocation uses one high-water scan, skips reservations, and fails fast on a broken directory', async () => {
+  await withDir(async (dir) => {
+    const history = join(dir, 'history')
+    await mkdir(history, { recursive: true })
+    await writeFile(join(history, 'st-500.ndjson'), `${JSON.stringify({ t: T0, d: payload('OLD\n') })}\n`, { mode: 0o600 })
+    await mkdir(join(history, '.ids'), { recursive: true })
+    await writeFile(join(history, '.ids', 'st-1'), '{}', { mode: 0o600 })
+    await writeFile(join(history, '.ids', 'st-2'), '{}', { mode: 0o600 })
+    const store = makeStore(history)
+    await store.init()
+    const id = await store.allocateSessionId()
+    assert.equal(id, 'st-501', 'the fresh high-water scan skips every used/reserved id')
+
+    const brokenPath = join(dir, 'not-a-directory')
+    await writeFile(brokenPath, 'x', { mode: 0o600 })
+    const broken = new HistoryStore({ dir: brokenPath, log: () => {} })
+    await broken.init()
+    const brokenId = await broken.allocateSessionId()
+    assert.equal(brokenId, undefined, 'a non-ENOENT directory error must fail allocation, not walk candidates')
+  })
+})
+
+test('a historyId-only query resolves its incarnation and list truncation is explicit', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    for (const [id, text] of [['st-1', 'ONE\n'], ['st-2', 'TWO\n']]) {
+      await store.openSession({
+        id, owner: 'owner-a', title: id, transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+      })
+      store.appendChunk(id, text, T0 + 1, 'owner-a')
+      await store.closeSession(id, { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    }
+    await settle(store)
+    const registry = makeRegistry(dir, store)
+    const list = await registry.historySessions({ owner: 'owner-a', actor: 'human' })
+    const first = list.find((entry) => entry.id === 'st-1')
+    assert.ok(first?.historyId)
+    const byHistoryId = await registry.historyQuery({ historyId: first.historyId, owner: 'owner-a', actor: 'human', search: 'ONE' })
+    assert.equal(byHistoryId.matches.length, 1, 'historyId alone must be resolved, not treated as a list request')
+    await rejectsWithCode(
+      () => registry.historyQuery({ historyId: 'st-1~missing', owner: 'owner-a', actor: 'human' }),
+      'SESSION_NOT_FOUND',
+    )
+    const page = await registry.historyQuery({ owner: 'owner-a', actor: 'human', limit: 1 })
+    assert.equal(page.sessions.length, 1)
+    assert.equal(page.truncated, true)
+    await registry.dispose()
+  })
+})
+
+test('history list keeps older incarnations that share a live logical id', async () => {
+  await withDir(async (dir) => {
+    const store = makeStore(dir)
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'old', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    store.appendChunk('st-1', 'OLD-INCARNATION\n', T0 + 1, 'owner-a')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 2, permission: { aiAccess: 'rw' } })
+    const handle = await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'live', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0 + 3,
+    })
+    assert.ok(handle && typeof handle === 'object')
+    const registry = makeRegistry(dir, store)
+    const now = Date.now()
+    registry.sessions.set('st-1', {
+      id: 'st-1', title: 'live', transport: 'ssh', host: 'h', port: 22, username: 'u', owner: 'owner-a', state: 'open',
+      createdAt: now, updatedAt: now, lastActivityAt: now, bytesIn: 0, bytesOut: 0, lastOutputAt: now,
+      permission: createPermission(registry.config), historyId: handle.historyId,
+    })
+    registry.owners.set('st-1', 'owner-a')
+    const page = await registry.historySessionsPage({ owner: 'owner-a', actor: 'human' })
+    const sameId = page.sessions.filter((entry) => entry.id === 'st-1')
+    assert.equal(sameId.length, 2, 'live plus the older incarnation must both be listed')
+    assert.equal(new Set(sameId.map((entry) => entry.historyId)).size, 2)
+    await registry.dispose()
+  })
+})
+
+test('a permanently failing writer bounds pending bytes, drops visibly and recovers', async () => {
+  await withDir(async (dir) => {
+    let failing = true
+    const logs = []
+    class FailingStore extends HistoryStore {
+      async appendJournal(file, data) {
+        if (failing) throw new Error('simulated permanent disk failure')
+        return super.appendJournal(file, data)
+      }
+    }
+    const store = new FailingStore({
+      dir,
+      retentionMs: 3_600_000,
+      maxBytesPerSession: 1_000_000,
+      maxSessions: 100,
+      flushIntervalMs: 60_000,
+      maxPendingBytes: 1024,
+      log: (level, message) => logs.push(`${level}:${message}`),
+    })
+    await store.init()
+    await store.openSession({
+      id: 'st-1', owner: 'owner-a', title: 'fail', transport: 'ssh', host: 'h', port: 22, username: 'u', createdAt: T0,
+    })
+    for (let index = 0; index < 30; index += 1) {
+      store.appendChunk('st-1', `CHUNK-${String(index).padStart(2, '0')} ${'X'.repeat(180)}\n`, T0 + index, 'owner-a')
+      await store.flush('st-1')
+    }
+    const failed = await store.stats('st-1')
+    assert.ok(failed)
+    assert.ok(failed.pendingBytes <= 1024, `pending must stay bounded, got ${failed.pendingBytes}`)
+    assert.ok(failed.droppedBytes > 0, 'the drop policy must be visible, not zero-loss')
+    assert.ok(failed.writeFailures > 0)
+    assert.equal(failed.degraded, true)
+    assert.ok(logs.length <= 4, `failure logging must be throttled, got ${logs.length}`)
+
+    failing = false
+    store.appendChunk('st-1', 'RECOVERED-NEWEST\n', T0 + 100, 'owner-a')
+    await store.flush('st-1')
+    const recovered = await store.stats('st-1')
+    assert.equal(recovered.pendingBytes, 0)
+    assert.equal(recovered.writeFailures, 0)
+    assert.equal(recovered.degraded, true, 'prior dropped bytes keep the alert sticky')
+    const journal = store.activeJournal('st-1', 'owner-a')
+    const text = decodedOutput(await readFile(journal, 'utf8'))
+    assert.equal(text.includes('RECOVERED-NEWEST'), true, 'newest output survives')
+    assert.equal(text.includes('CHUNK-00 '), false, 'old unsaved bytes were explicitly dropped')
+    await store.closeSession('st-1', { owner: 'owner-a', closedAt: T0 + 101, permission: { aiAccess: 'rw' } })
+    await store.dispose()
   })
 })

@@ -393,7 +393,7 @@ export class OutputLog {
 
 目录：`<dataDir>/history/`，`<dataDir>` 默认 `~/.dsh/aiterm`。
 
-> **v8 安全变更（0.5.5）**：
+> **v8 安全变更（0.5.6）**：
 > 1. 会话 id（`st-N`）不再每次启动从 1 开始。历史目录的 `.ids/st-N` 用 `open(..., 'wx')`
 >    原子预留，跨重启、跨并发宿主续号；分配前还会跳过已有 journal 或已有 `<id>.log` 的 id。
 > 2. 每次 `openSession()` 仍用 `open(..., 'wx')` 独占创建新的 incarnation journal
@@ -427,6 +427,7 @@ export class HistoryStore {
     maxBytesPerSession: number,   // 默认 8 MiB
     maxSessions: number,          // 默认 100
     flushIntervalMs?: number,     // 默认 250
+    maxPendingBytes?: number,     // 默认 1 MiB/会话（1024..64 MiB），超限丢最旧
     log?: (level: string, message: string) => void,
   })
   async init(): Promise<void>
@@ -458,18 +459,40 @@ export class HistoryStore {
 - 任何磁盘错误只记 warn，绝不影响终端会话。**append 失败时批次放回 pending**，close 只有在
   pending 清空后才删除 writer 并追加关闭元数据；否则保留 state 供 `flush()`/`dispose()` 重试，
   且关闭权限保持未知（AI fail closed）。
+- pending 有界：`maxPendingBytes` 默认 1 MiB/会话（1024..64 MiB）。超限时**从最旧未落盘记录开始丢弃**，
+  单个超大 chunk 直接丢弃；`stats()` 暴露 `pendingBytes/droppedBytes/writeFailures/retryDelayMs/degraded`。
+  `degraded` 一旦发生过丢弃就保持为 true。失败日志按 60s 节流，重试指数退避到 60s。**这不是零丢失语义**。
 - 单文件超过 `maxBytesPerSession` 时截断为尾部内容，**必须保留第一行文件头**；文件头无法确认时放弃截断（fail closed）。
 - 任意 journal 缺文件头/关闭权限缺失 → AI fail closed。legacy 只允许显式 `actor:'human'` 的 `history.legacy.*`
   读取，且必须能在 `index.json` 中存在（孤儿文件不暴露）；旧文件不改不删。
 - 未知 id 的查询最多每 `SCAN_COOLDOWN_MS`（1s）扫一次目录，避免被反复猜测 id 放大 I/O。
-- 搜索对 live 与 closed 一致地不区分大小写。导出按 64 KiB 块**流式**读取/写入，不设固定
-  单文件上限（覆盖配置允许的 512 MiB），显式导出源文件消失返回 `SESSION_NOT_FOUND`；
-  `all` 中缺失/不可读的源写入 `skipped[{sessionId,historyId,code,message}]`，绝不写空文件冒充成功。
-  同一逻辑 id 的每个可读 incarnation 都单独导出，文件名含 incarnation 短码与随机短码，并发不冲突。
+- 搜索对 live 与 closed 一致地不区分大小写。`query()` 只读取**尾部 `maxBytes`**（默认 8 MiB，
+  上限 256 MiB）到内存；不是整文件 `readFile`。`truncateSession()` 仍会整文件读取后重写为尾部，
+  这是唯一非流式的历史操作（文件由 `maxBytesPerSession` 约束，明确记录）。
+- 导出按 64 KiB 块**流式**读取/写入，单文件无固定上限（覆盖配置允许的 512 MiB）；单次调用有
+  `maxTotalBytes` 预算（默认 512 MiB），超出时整个 incarnation 写入 `skipped[].code='EXPORT_BUDGET'`，
+  已完成的文件保持独立有效。`FileHandle.write` 的 partial write 用循环处理；失败不 rename、不残留 temp。
+  - 源在 stat 时冻结 `snapshotBytes`；读取严格不超过该边界，因此持续写入不会挂起，也不会把
+    快照后的新输出（包括权限撤销后的输出）纳入。
+  - stat 后、开始读取前调用 `beforeRead(address)` **复验 owner/actor/当前权限**；explicit 失败抛错，
+    `all` 跳过并记录。rw→wo 后不会导出新内容。
+  - 显式导出源文件消失 → `SESSION_NOT_FOUND`；`all` 中缺失/不可读的源写入
+    `skipped[{sessionId,historyId,code,message}]`，绝不写空文件冒充成功。错误文本不包含私有 journal
+    path（宿主日志也优先只记录错误 code）。
+  - 同一逻辑 id 的每个可读 incarnation 都单独导出，文件名含 incarnation 短码与随机短码，并发不冲突。
+  - `historyId` 单独请求会解析对应 incarnation 后执行 query；找不到明确 404，不会被当成列表请求忽略。
+  - 列表分页返回 `truncated/total`；只过滤当前 live 的精确 incarnation（按 `historyId`），同 id 的旧
+    incarnation 仍保留。导出上限超出同样进入 `skipped`（`EXPORT_LIMIT`）。
 - 多个 `HistoryStore` 并发/重载/旧实例延迟 flush 时，`wx` id/journal 预留与独立文件名保证不串写；
   `index.json` 的 last-writer-wins 不影响归属判定。
-- 审计：live 会话的 history slice/export 会写入该会话的审计环；已关闭会话没有进程内审计归属，
-  目前不记录（如需持久审计需另行设计）。
+- **prune 保守策略**：没有跨进程活动租约，因此**无 close 元数据的 journal 永不自动删除**（可能是
+  另一进程的 live writer，也可能是 crash 数据；保留优于误删）。只有带 close 元数据的 journal 才按
+  `max(lastTs, closedAt, stat.mtime)` 判老；大尾行/最近写入不会因旧 `lastTs` 被误删。不可验证租约时
+  不承诺多 Host retention 一致；unclosed 可能长期占用磁盘。
+- 审计：write/deny **不记录任何输入原文**，只保留 action/source/code/byteLength 等元数据。
+  旧内存审计可能含历史原文；`audit({actor:'ai'})` 在返回前把所有 `detail` 脱敏为
+  `<action>:redacted`（human 视图保留原值）。live 会话的 history slice/export 写入会话审计环；
+  已关闭会话没有进程内审计归属，目前不记录（如需持久审计需另行设计）。
 
 ## 11. 批量与脚本（`lib/host/batch.js`、`lib/host/scripts.js`）
 
