@@ -133,7 +133,8 @@ sed -i 's#"ssh-telnet/#"aiterm/#' ~/.dsh/aiterm/secrets.json
 AI 不能提供密码或私钥：需要密码/私钥的连接必须使用保存的 profile，由 Host 侧解析。**带 `profileId` 时 AI 只能传 profileId（及 title/cols/rows）**；transport/host/port/username/authType 只要**字段存在且非 undefined**（含 null/空串/false/0/NaN/对象）就会被 403 `AI_PROFILE_TARGET_DENIED` 拒绝，且拒绝发生在读取 profile 密钥之前。AI 解析完全使用保存的 transport/host/port/username/authType，不依赖 schema 校验，防止保存的密码被发往 AI 指定的目标或默认端口。人工在表单里的地址覆盖仍保持原有行为（保存密码复用于人工编辑的目标）。
 - AI reconnect 只有在保存 profile 的 endpoint/auth 身份与 session 初始绑定完全一致时才取新 secret；profile 目标或认证方式被人工改动后，AI 会以 `PROFILE_TARGET_CHANGED` 拒绝并提示从面板重开，绝不把新凭据发往旧 endpoint。Telnet 的有效 auth 身份恒为 none，不读取 profile secret；SSH 才比较 authType。人类在身份不一致时复用 session 原有 auth，不把新 profile secret 发往旧目标。
 
-以上是 `toolDisclosure: full`（默认）下的完整工具面。`progressive` 会额外常驻一个发现入口
+以上是 `toolDisclosure: full` 下的完整工具面。本包随包发布的 config 默认是 `progressive`：
+它在 `full` 之上额外常驻一个发现入口
 `aiterm_discover`（它不属于上面任何业务分组，也不接触终端）。其余工具的名称、参数、执行体、
 owner 绑定和权限判定都不变；唯一的注册差异是它们会额外带一个**步骤级可见条件**，因此要按组
 展开后才在下一步可见——见下方「工具渐进披露」。
@@ -145,15 +146,15 @@ owner 绑定和权限判定都不变；唯一的注册差异是它们会额外�
 默认值补齐，所以"只写要改的键"会让其余键悄悄回到默认值——例如 `aiAccessDefault` 默认是
 `rw`，此前设为 `ro` 的部署会因为漏写而**放宽 AI 权限**。
 
-因此升级或改配置时请**保留完整对象**并显式写出安全值。下面的示例是全量配置（值均为默认值，
-只把 `aiAccessDefault` 显式固定为 `ro`）；请按需修改，不要删掉你依赖的键：
+因此升级或改配置时请**保留完整对象**并显式写出安全值。下面的示例是全量配置（`toolDisclosure`
+显式写回 `full`、`aiAccessDefault` 显式固定为 `ro`，其余为默认值）；请按需修改，不要删掉你依赖的键：
 
 ```yaml
 - id: aiterm
   name: 'dsh-aiterm'
   config:
     enabled: true
-    toolDisclosure: full            # full（默认，21 个工具全量注册）| progressive（先发现、按组展开）
+    toolDisclosure: full            # full（21 个工具全量注册）| progressive（先发现、按组展开；本包发布默认）
     aiAccessDefault: ro             # 新会话默认 AI 权限：ro | wo | rw；显式写出，避免漏写回落到 rw
     aiAutoLock: true                # AI 写入时是否自动取得控制权
     aiLockIdleMs: 30000             # AI 控制权空闲自动释放时间
@@ -191,10 +192,10 @@ owner 绑定和权限判定都不变；唯一的注册差异是它们会额外�
 
 ## 工具渐进披露（`toolDisclosure: progressive`）
 
-默认的 `full` 保持历史行为：21 个 `aiterm_*` 工具对每个 Agent **无条件**注册，参数、
+`full` 保持历史行为：21 个 `aiterm_*` 工具对每个 Agent **无条件**注册，参数、
 描述、执行体、终端 owner 和权限判定全部不变。
 
-改成 `progressive` 后，只常驻一个发现入口 `aiterm_discover`；其余工具仍按原名注册，
+改为 `progressive`（本包发布默认）后，只常驻一个发现入口 `aiterm_discover`；其余工具仍按原名注册，
 但附带一个**步骤级**条件：只有当前模型步骤的 Agent 已展开对应分组时才进入该步骤的
 工具快照。发现入口本身不接受任何终端操作，也不改变权限。
 
@@ -280,7 +281,8 @@ automation 组即使展开也不可见）。见 `test/disclosure-runtime.test.mj
   DSH 重启后清空。重载后模型需要重新 `aiterm_discover`。
 - 建议在两次操作之间、没有正在跑的命令时切换；不要在长命令执行中切换。
 
-回滚：把 `toolDisclosure` 改回 `full`（或删掉该项）并重载插件/重启 DSH Web。`full`
+回滚：在本插件行写入全量 config 并把 `toolDisclosure` 设为 `full`（只写这一项会让其余键
+回落到默认值）并重载插件/重启 DSH Web。`full`
 不注册 `aiterm_discover`，21 个工具恢复无条件注册。终端需要重新打开；脚本和 profile 是
 磁盘数据，不受影响；输出历史按保留期保留（历史面板/导出可读取这些文件，但重启后的
 归属与可见性见「终端与 AI 会话的归属」）；审计只在内存中，重载后已清空。无需迁移数据。

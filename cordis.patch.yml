@@ -6,6 +6,7 @@
     - id: aiterm
       name: 'dsh-aiterm'
       config:
+        toolDisclosure: progressive
         aiAccessDefault: rw
         aiAutoLock: true
         aiLockIdleMs: 30000
