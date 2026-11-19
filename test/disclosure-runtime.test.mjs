@@ -23,8 +23,8 @@ import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
 import { DISCLOSURE_GROUPS } from '../lib/host/disclosure.js'
-import { PROGRESSIVE_PROMPT_TEXT, PROMPT_TEXT, registerPrompt } from '../lib/host/prompt.js'
-import { registerTools } from '../lib/host/tools.js'
+import { PROMPT_TEXT, registerPrompt } from '../lib/host/prompt.js'
+import { DISCOVER_TOOL_DESCRIPTION, registerTools } from '../lib/host/tools.js'
 
 const DISCOVER = 'aiterm_discover'
 const GROUP_ORDER = Object.keys(DISCLOSURE_GROUPS)
@@ -376,56 +376,42 @@ test('agent disposal forgets that Agent and plugin disposal clears the controlle
   assert.equal(await listWhen({ agent: agentB, modelSelection, signal: new AbortController().signal }), false)
 })
 
-test('the prompt follows the configured mode and progressive text names only the discovery entry', () => {
-  /**
-   * @param {string} mode disclosure mode.
-   * @returns {{ sections: any[] }} captured prompt section.
-   */
-  function capture(mode) {
-    const sections = []
-    const ctx = {
-      inject(services, callback) {
-        assert.deepEqual(services, ['systemPrompt'])
-        callback({
-          effect(run) {
-            run()
+test('full mode gets the prompt section; progressive keeps the rules in the discovery entry only', () => {
+  const sections = []
+  const ctx = {
+    inject(services, callback) {
+      assert.deepEqual(services, ['systemPrompt'])
+      callback({
+        effect(run) {
+          run()
+        },
+        systemPrompt: {
+          section(options) {
+            sections.push(options)
+            return () => {}
           },
-          systemPrompt: {
-            section(options) {
-              sections.push(options)
-              return () => {}
-            },
-            getSectionOrder() {
-              return 42
-            },
+          getSectionOrder() {
+            return 42
           },
-        })
-      },
-    }
-    registerPrompt(ctx, mode)
-    assert.equal(sections.length, 1)
-    return { sections }
+        },
+      })
+    },
   }
 
-  const full = capture('full')
-  assert.equal(full.sections[0].text, PROMPT_TEXT)
-  assert.equal(full.sections[0].text.includes(DISCOVER), false)
+  registerPrompt(ctx)
+  assert.equal(sections.length, 1)
+  assert.equal(sections[0].text, PROMPT_TEXT)
+  assert.equal(sections[0].text.includes(DISCOVER), false)
 
-  const progressive = capture('progressive')
-  assert.equal(progressive.sections[0].text, PROGRESSIVE_PROMPT_TEXT)
-  assert.match(progressive.sections[0].text, /aiterm_discover/)
-  assert.match(progressive.sections[0].text, /next model step/i)
-  assert.match(progressive.sections[0].text, /permission/i)
-  assert.match(progressive.sections[0].text, /release/i)
-  // Only the always-resident entry may be named statically: every other tool
-  // name could be hidden from this Agent by another restriction.
+  // `progressive` mode registers no section at all: the same rules ride on the
+  // always-resident discovery entry, so the request carries them exactly once.
+  assert.match(DISCOVER_TOOL_DESCRIPTION, /Discover the SSH\/Telnet toolset/)
+  assert.match(DISCOVER_TOOL_DESCRIPTION, /next model step/i)
+  assert.match(DISCOVER_TOOL_DESCRIPTION, /permission/i)
+  assert.match(DISCOVER_TOOL_DESCRIPTION, /release/i)
   for (const name of ORIGINAL_TOOLS) {
-    assert.equal(progressive.sections[0].text.includes(name), false, `prompt leaks ${name}`)
+    assert.equal(DISCOVER_TOOL_DESCRIPTION.includes(name), false, `description leaks ${name}`)
   }
-
-  // Unknown modes fall back to the historical prompt.
-  assert.equal(capture(undefined).sections[0].text, PROMPT_TEXT)
-  assert.equal(capture('FULL').sections[0].text, PROMPT_TEXT)
 })
 
 /**

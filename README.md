@@ -199,6 +199,10 @@ owner 绑定和权限判定都不变；唯一的注册差异是它们会额外�
 但附带一个**步骤级**条件：只有当前模型步骤的 Agent 已展开对应分组时才进入该步骤的
 工具快照。发现入口本身不接受任何终端操作，也不改变权限。
 
+> `progressive` 下**不再注入独立的系统提示段**：权限模型、控制权释放、先读屏再发命令等规则
+> 全部写在 `aiterm_discover` 的工具描述里（`DISCOVER_TOOL_DESCRIPTION`），每轮只出现一次。
+> `full` 模式仍然注入 `tool:aiterm` 提示段。
+
 | 分组 | 成员 | 何时可用 |
 | --- | --- | --- |
 | `session` | `list` / `status` / `read` / `screen` / `screenshot` / `wait` / `send` / `release_control` | 展开 `session` 后的**下一个**模型步骤 |
