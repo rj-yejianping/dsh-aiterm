@@ -1,6 +1,6 @@
 {
   "name": "dsh-aiterm",
-  "version": "0.5.13",
+  "version": "0.5.14",
   "description": "SSH and Telnet terminals for DeepSeek Harness: one real terminal shared by you and the AI, with per-session AI permissions and token-cheap delta reads.",
   "type": "module",
   "license": "MIT",

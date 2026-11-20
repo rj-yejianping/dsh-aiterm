@@ -65,7 +65,7 @@ import {
   PowerIcon,
   useFocusRing,
 } from './ui.jsx'
-import { C, S, focusRing } from './styles.js'
+import { C, S } from './styles.js'
 
 function translate(t) {
   return typeof t === 'function' ? t : (key) => key
@@ -304,9 +304,11 @@ function SessionRail({ t }) {
  * Three visual states that must not be confused with each other:
  *  - **selected**: accent bar + accent border + accent-tinted surface + bold title;
  *  - **hover**: a soft wash only, always weaker than selected;
- *  - **keyboard focus**: the ring, and only for keyboard navigation
- *    (`useFocusRing` asks `:focus-visible`), so clicking a tab never leaves a
- *    white box behind on a tab that is no longer selected.
+ *  - **keyboard focus**: the ring overlay, and only for real keyboard navigation
+ *    (`useFocusRing` asks `:focus-visible` *and* the Host's input modality), so
+ *    clicking a tab never leaves a white box behind — neither on the clicked tab
+ *    nor on the tab that was selected before. The ring is a separate layer so it
+ *    cannot replace the selected chip's accent bar.
  *
  * @param props.t - locale translator.
  * @param props.session - session info.
@@ -324,7 +326,6 @@ function SessionChip({ t, session, label, active, disconnected, onSelect, onRequ
     ...S.railChip,
     ...(active ? S.railChipActive : null),
     ...(!active && hover ? S.railChipHover : null),
-    ...(focus ? { boxShadow: focusRing(true) } : null),
   }
   return (
     <div
@@ -332,6 +333,10 @@ function SessionChip({ t, session, label, active, disconnected, onSelect, onRequ
       style={chipStyle}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      // A click on the chip padding does not move DOM focus off the previously
+      // focused tab; dropping the ring here keeps a stale keyboard box from
+      // outliving the selection.
+      onPointerDown={focusProps.onPointerDown}
     >
       <button
         type="button"
@@ -378,6 +383,9 @@ function SessionChip({ t, session, label, active, disconnected, onSelect, onRequ
       <IconBtn size={26} danger title={t('closeSession')} onClick={onRequestClose}>
         <CloseIcon size={12} />
       </IconBtn>
+      {/* Last child on purpose: the ring paints over the chip's own border and
+          the close button's hover wash, never under them. */}
+      {focus ? <span aria-hidden="true" style={S.railChipRing} /> : null}
     </div>
   )
 }

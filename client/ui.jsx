@@ -9,6 +9,7 @@
  */
 
 import { useEffect, useState } from 'react'
+import { focusRingVisible } from './focus.js'
 import { C, S, focusRing } from './styles.js'
 
 /**
@@ -17,18 +18,45 @@ import { C, S, focusRing } from './styles.js'
  * A plain `onFocus` ring paints after a mouse click too, so clicking a tab left
  * a white outline on it while the *selection* moved elsewhere — two different
  * "boxes" competing in the session rail. `:focus-visible` only matches when the
- * user is navigating by keyboard, which is the case the ring exists for.
+ * user is navigating by keyboard, which is the case the ring exists for, and
+ * the Host's input modality (`pointer`) is required to still be `keyboard`.
+ *
+ * The ring is also dropped on *any* pointer press, not only on this control:
+ * selecting another tab by clicking its padding does not move DOM focus, so
+ * without that the previous tab kept a stale keyboard ring after the selection
+ * had already moved. See `client/focus.js`.
  *
  * @returns {{focus: boolean, focusProps: object}} ring flag and the props to spread.
  */
 export function useFocusRing() {
   const [focus, setFocus] = useState(false)
+  // Only listen while a ring is actually painted: the panel renders dozens of
+  // controls, and a listener per control would be noise for the common case.
+  useEffect(() => {
+    if (!focus) return undefined
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+    const dismiss = () => setFocus(false)
+    document.addEventListener('pointerdown', dismiss, true)
+    return () => {
+      try {
+        document.removeEventListener('pointerdown', dismiss, true)
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [focus])
   const focusProps = {
+    onPointerDown() {
+      setFocus(false)
+    },
     onFocus(event) {
       let visible = false
       try {
         const node = event && event.currentTarget
-        visible = typeof node.matches === 'function' ? node.matches(':focus-visible') : false
+        const matches = typeof node.matches === 'function' ? node.matches(':focus-visible') : false
+        const root = typeof document === 'undefined' ? null : document.documentElement
+        const modality = root && root.dataset ? root.dataset.inputModality : undefined
+        visible = focusRingVisible(matches, modality)
       } catch {
         visible = false
       }
@@ -49,7 +77,13 @@ const BTN_BASE = {
   flex: 'none',
   height: 32,
   padding: '0 12px',
-  border: '0.5px solid transparent',
+  // Longhands: variants override `borderColor`, and React removes a longhand
+  // that the next render's style object no longer lists. With the shorthand the
+  // removed colour falls back to `currentColor`, leaving a text-coloured border
+  // when a button switches back from `outline` / `primary`.
+  borderWidth: '0.5px',
+  borderStyle: 'solid',
+  borderColor: 'transparent',
   borderRadius: C.radiusSm,
   background: 'transparent',
   color: C.labelSecondary,

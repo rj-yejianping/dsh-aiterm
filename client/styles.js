@@ -32,11 +32,11 @@ export const C = {
   warn: 'var(--dsw-alias-state-warn-primary)',
   warnLabel: 'var(--dsw-alias-state-warn-label)',
   idle: 'var(--dsw-alias-state-idle-primary)',
+  businessPrimary: 'var(--dsw-alias-state-business-primary)',
   toastBg: 'var(--dsw-alias-toast-bg)',
   toastLabel: 'var(--dsw-alias-toast-label)',
   radiusSm: 'var(--dsw-radius-sm)',
   radiusMd: 'var(--dsw-radius-md)',
-  focusRing: 'var(--dsw-focus-ring-color)',
   elevationSoft: 'var(--dsw-elevation-soft)',
   elevationPanel: 'var(--dsw-elevation-panel)',
   fontFamily: 'var(--dsw-font-family)',
@@ -81,7 +81,13 @@ export const S = {
     maxWidth: 190,
     height: 34,
     padding: '0 4px 0 10px',
-    border: `0.5px solid transparent`,
+    // Longhands, not the `border` shorthand: the selected state overrides
+    // `borderColor`, and React's style diff deletes a longhand the next render
+    // no longer lists. With the shorthand the deleted color falls back to
+    // `currentColor`, leaving a text-coloured 1px box on the deselected chip.
+    borderWidth: '0.5px',
+    borderStyle: 'solid',
+    borderColor: 'transparent',
     borderRadius: C.radiusSm,
     background: 'transparent',
     color: C.labelSecondary,
@@ -109,6 +115,22 @@ export const S = {
   railChipHover: {
     background: C.hover,
     color: C.labelPrimary,
+  },
+  /**
+   * Keyboard focus ring for a rail chip, drawn as an overlay on top of the chip
+   * instead of as its `boxShadow`: the selected chip already uses `boxShadow`
+   * for the accent bar, and letting the ring replace it made a focused selected
+   * tab lose its marker. The explicit fallback matters because the panel paints
+   * the ring on the wrapper, where the Host's pointer-modality suppression of
+   * `--dsw-focus-ring-color` never applies — an undefined token must not leave a
+   * `currentColor` box behind.
+   */
+  railChipRing: {
+    position: 'absolute',
+    inset: 0,
+    border: `1px solid var(--dsw-focus-ring-color, ${C.businessPrimary})`,
+    borderRadius: 'inherit',
+    pointerEvents: 'none',
   },
   railTitle: {
     minWidth: 0,
@@ -140,7 +162,11 @@ export const S = {
     justifyContent: 'center',
     padding: '1px 4px',
     borderRadius: 3,
-    border: '0.5px solid transparent',
+    // Same longhand rule as the rail chip: the transport variants set
+    // `borderColor`, so the base keeps the color property present.
+    borderWidth: '0.5px',
+    borderStyle: 'solid',
+    borderColor: 'transparent',
     fontSize: 9,
     lineHeight: '12px',
     letterSpacing: '0.04em',
@@ -1309,7 +1335,11 @@ export const S = {
     flex: 'none',
     minWidth: 0,
     padding: '8px 9px',
-    border: `0.5px solid ${C.borderL1}`,
+    // Longhands: the highlight state overrides `borderColor`, and a removed
+    // longhand would fall back to `currentColor`.
+    borderWidth: '0.5px',
+    borderStyle: 'solid',
+    borderColor: C.borderL1,
     borderRadius: C.radiusSm,
     background: C.bgLayer1,
   },
@@ -1415,5 +1445,5 @@ export const S = {
  * @returns a box-shadow value, or undefined.
  */
 export function focusRing(visible) {
-  return visible ? `inset 0 0 0 1px ${C.focusRing}` : undefined
+  return visible ? `inset 0 0 0 1px var(--dsw-focus-ring-color, ${C.businessPrimary})` : undefined
 }

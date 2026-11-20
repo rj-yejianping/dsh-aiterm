@@ -870,10 +870,67 @@ await setSessions([
     String(afterChips[1].props.style.borderColor || '').includes('brand'),
     'the accent border must move to the clicked chip',
   )
+  // Regression (user report): the deselected chip kept a text-coloured 1px box.
+  // The chip overrode `borderColor` while selected, and React deletes a longhand
+  // the next style object no longer lists — with the `border` shorthand the
+  // deleted colour fell back to `currentColor`. The base style must therefore
+  // always carry an explicit `borderColor` (and longhand width/style).
+  assert.equal(
+    afterChips[0].props.style.borderColor,
+    'transparent',
+    'the deselected chip must keep an explicit transparent border colour',
+  )
+  assert.equal(afterChips[0].props.style.borderWidth, '0.5px', 'the rail chip must set borderWidth as a longhand')
+  assert.equal(afterChips[0].props.style.borderStyle, 'solid', 'the rail chip must set borderStyle as a longhand')
   assert.ok(
     !String(afterChips[0].props.style.borderColor || '').includes('brand'),
     'the previously selected chip must drop the accent border',
   )
+}
+
+/* ------------------------------------------------------------------ *
+ * Scenario 2c — keyboard focus ring: keyboard only, never a pointer, and
+ * never at the cost of the selected chip's accent bar.
+ *
+ * Regression (user report): after switching tabs the tab selected before kept
+ * a white box. The chip paints the ring on its wrapper, which no pointer
+ * modality suppression reaches, so the ring decision also requires the Host's
+ * `data-input-modality` to not be `pointer`, and any pointer press clears it.
+ * ------------------------------------------------------------------ */
+
+{
+  const ringNodes = () => collect(lastTree, (node) => node.props
+    && node.props['aria-hidden'] === 'true'
+    && node.props.style
+    && node.props.style.pointerEvents === 'none'
+    && node.props.style.borderRadius === 'inherit'
+    && String(node.props.style.border || '').includes('1px solid'))
+  const tabsNow = () => collect(lastTree, (node) => node.props && node.props.role === 'tab')
+  const chipsNow = () => collect(lastTree, (node) => node.props && node.props.role === 'presentation')
+
+  sandbox.document.documentElement.dataset = { inputModality: 'keyboard' }
+  tabsNow()[1].props.onFocus({ currentTarget: { matches: (selector) => selector === ':focus-visible' } })
+  await settle('keyboard focus on the second tab')
+  // The VM hook runtime keys instances by component function, so all chips share
+  // one focus hook here; the real tree has one hook per chip. Only presence is
+  // meaningful in this harness.
+  assert.ok(ringNodes().length >= 1, 'a keyboard focus must paint the ring')
+  assert.ok(
+    String(chipsNow()[1].props.style.boxShadow || '').includes('inset 3px'),
+    'the selected chip must keep its accent bar while the ring is shown',
+  )
+
+  // A pointer press on the chip drops its ring.
+  tabsNow()[1].props.onPointerDown()
+  await settle('pointer down on the focused tab')
+  assert.equal(ringNodes().length, 0, 'a pointer press must drop the ring')
+
+  // Even when the browser reports :focus-visible, pointer modality wins.
+  sandbox.document.documentElement.dataset = { inputModality: 'pointer' }
+  tabsNow()[0].props.onFocus({ currentTarget: { matches: () => true } })
+  await settle('focus under pointer modality')
+  assert.equal(ringNodes().length, 0, 'pointer modality must never paint the focus ring')
+  sandbox.document.documentElement.dataset = {}
 }
 
 // Restore the single-session scene for the scenarios that follow.
